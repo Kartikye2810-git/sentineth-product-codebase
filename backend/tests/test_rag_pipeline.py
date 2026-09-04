@@ -190,7 +190,7 @@ def test_non_pdf_upload_is_rejected(client, organization, vector_store):
         files=(("file", ("notes.txt", b"plain text notes", "text/plain")),),
     )
 
-    assert response.status_code == 415
+    assert response.status_code == 200  # deliberately wrong: proving CI blocks merges
     assert response.json()["detail"]["error_code"] == "UNSUPPORTED_MEDIA_TYPE"
     assert vector_store.points == {}
 
