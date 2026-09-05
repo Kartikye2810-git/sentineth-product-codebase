@@ -63,3 +63,109 @@ jobs:
       - name: alembic check
         # Fails if app/db/models.py has drifted from alembic/versions.
         run: alembic check
+
+  eval:
+    # Non-blocking on purpose, and it must never be added to the required
+    # checks. Retrieval quality is a number to watch and argue about, not a
+    # gate: a legitimate change can move recall a point in either direction,
+    # and a red X for that would only teach everyone to ignore red Xs. The
+    # `backend` job above is the one that decides whether a PR can merge.
+    name: eval (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.0
+        ports:
+          - 6333:6333
+
+    env:
+      QDRANT_URL: http://localhost:6333
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Wait for Qdrant
+        # Polled from the runner rather than declared as a service
+        # `--health-cmd`: the qdrant image ships no curl or wget, so a
+        # health command running inside the container never succeeds.
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:6333/healthz > /dev/null; then
+              echo "qdrant ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "qdrant did not become ready in 60s"
+          exit 1
+
+      - name: Render the corpus
+        # PDFs are built from the markdown sources rather than committed, so
+        # the corpus stays diffable and this step also exercises the renderer.
+        run: python eval/build_corpus.py
+
+      - name: Score retrieval
+        run: python eval/harness.py --report eval-report.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: backend/eval-report.json
+
+      - name: Comment the numbers on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const r = JSON.parse(fs.readFileSync('backend/eval-report.json', 'utf8'));
+            const m = r.metrics;
+            const c = r.configuration;
+            const pct = (x) => `${(x * 100).toFixed(1)}%`;
+
+            const body = [
+              '**Retrieval eval**',
+              '',
+              `| recall@1 | recall@3 | recall@5 | MRR |`,
+              `| --- | --- | --- | --- |`,
+              `| ${pct(m['recall@1'])} | ${pct(m['recall@3'])} | ` +
+                `${pct(m['recall@5'])} | ${m.mrr.toFixed(3)} |`,
+              '',
+              `${r.corpus.documents} documents / ${r.corpus.chunks} chunks · ` +
+                `${r.questions.total} questions · ${c.embedding_provider} ` +
+                `(${c.dimension}d) · chunker ${c.chunker.chunk_size} chars / ` +
+                `${c.chunker.overlap} overlap`,
+              '',
+              '<sub>This job is advisory and never blocks a merge. Chunk count ' +
+                'is part of the result: recall@5 over more, smaller chunks is a ' +
+                'harder test than the same number over fewer, larger ones.</sub>',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
