@@ -51,8 +51,11 @@ async def ingest_document(
                 "Could not read text from the document."
             ) from exc
 
-        # Split extracted text into chunks.
-        chunks = chunk_text(text)
+        # Split extracted text into chunks the embedding provider can
+        # read in full. The provider is passed in rather than consulted
+        # later so the chunk size and the model that embeds it can never
+        # be configured independently of each other.
+        chunks = chunk_text(text, embedding_provider)
 
         if not chunks:
             raise ExtractionFailed(

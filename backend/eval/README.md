@@ -124,17 +124,44 @@ lexical overlap and flatter every retriever equally.
 report prints how many are still draft, so a number is never quoted without
 saying how provisional its ground truth is.
 
+## Comparing two runs
+
+```bash
+python eval/compare.py before.json after.json
+```
+
+**Do not read a delta between two headline percentages.** The same questions
+are scored before and after, so the runs are paired, and the quantity that
+matters is which individual questions changed. Two runs can differ by four
+points of recall@5 with eighteen questions moving one way and thirteen the
+other — that is a reshuffle — or with eighteen moving one way and none the
+other, which is a result. `compare.py` prints won/lost counts and McNemar's
+exact p-value over the questions that changed.
+
+The scale of the noise is worth internalising: sweeping the chunk token
+target from 120 to 252 moved recall@5 between 76.5% and 82.4% **with no
+trend**, adjacent targets disagreeing as much as distant ones. On 102
+questions, a six-point swing can be nothing more than where the chunk
+boundaries happened to fall. A coarse sweep of the same parameter had
+produced a convincing-looking peak that the finer sweep dissolved.
+
 ## Reading the numbers
 
 **Chunk count is part of the result.** recall@5 over 33 large chunks and
-recall@5 over 130 small ones are not the same test: the second asks the
-retriever to find the answer in a much smaller slice of the corpus. Item 1.2
-cuts chunk size by four, so its recall@5 is measured against a strictly
-harder task, and a flat number there is an improvement rather than a wash.
-Every report records the chunk size, overlap, provider and dimension that
+recall@5 over 88 smaller ones are not the same test: the second asks the
+retriever to find the answer in a much smaller slice of the corpus. Every
+report records the token window, overlap, provider and dimension that
 produced it for exactly this reason — quote those alongside the metric or
 the metric is not comparable to anything.
 
+**A headline number can hide two effects that cancel.** Item 1.2 moved
+recall@5 by +4.9pp overall, p=0.47, which reads as "no change". Splitting
+the questions by whether the truncation defect could reach them showed
++14.9pp on the 67 it had made invisible and −14.3pp on the 35 it never
+touched. Both effects are real and the average of them is not. When a
+change has a mechanism, define the subgroup that mechanism predicts — from
+the configuration, before looking at any result — and score that subgroup
+too.
 ## In CI
 
 The `eval` job in `.github/workflows/ci.yml` runs the harness on every PR,

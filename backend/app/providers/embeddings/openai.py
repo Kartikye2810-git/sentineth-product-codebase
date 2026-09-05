@@ -33,6 +33,24 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     def dimension(self) -> int:
         return 1536
 
+    @property
+    def max_input_tokens(self) -> int:
+        # text-embedding-3-small accepts 8,191 tokens.
+        return 8191
+
+    def count_tokens(self, texts: list[str]) -> list[int]:
+        """Approximate, deliberately, and biased to over-count.
+
+        The exact answer needs tiktoken, which this project does not
+        depend on. The approximation is safe here for two reasons: the
+        chunker only uses counts to stay *under* a budget, and three
+        characters per token over-estimates English prose, which averages
+        closer to four - so chunks come out smaller than they had to be
+        rather than larger than the model will read. If this provider ever
+        becomes the default, add tiktoken and make this exact.
+        """
+        return [-(-len(text) // 3) for text in texts]
+
     async def embed(
         self,
         texts: list[str],

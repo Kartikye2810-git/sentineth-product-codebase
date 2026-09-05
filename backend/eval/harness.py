@@ -21,7 +21,6 @@ question set stays comparable across the whole phase.
 
 import argparse
 import asyncio
-import inspect
 import json
 import os
 import re
@@ -44,7 +43,11 @@ from app.providers.embeddings.base import EmbeddingProvider  # noqa: E402
 from app.providers.embeddings.local import LocalEmbeddingProvider  # noqa: E402
 from app.providers.vector.base import VectorStore  # noqa: E402
 from app.providers.vector.qdrant import QdrantVectorStore  # noqa: E402
-from app.services.chunking_service import chunk_text  # noqa: E402
+from app.services.chunking_service import (  # noqa: E402
+    OVERLAP_RATIO,
+    SPECIAL_TOKEN_MARGIN,
+    chunk_text,
+)
 from app.services.extraction_service import extract_text_from_pdf  # noqa: E402
 
 
@@ -179,7 +182,7 @@ async def index_corpus(
 
     for pdf in sorted(corpus.glob("*.pdf")):
         doc = pdf.stem
-        chunks = chunk_text(extract_text_from_pdf(str(pdf)))
+        chunks = chunk_text(extract_text_from_pdf(str(pdf)), embedding_provider)
 
         if not chunks:
             counts[doc] = 0
@@ -269,13 +272,12 @@ def score(results: list[Result]) -> dict[str, float]:
 
 def configuration(embedding_provider: EmbeddingProvider) -> dict[str, Any]:
     """Record the settings that produced a number, so runs stay comparable."""
-    defaults = inspect.signature(chunk_text).parameters
-
     return {
         "chunker": {
             "function": f"{chunk_text.__module__}.{chunk_text.__name__}",
-            "chunk_size": defaults["chunk_size"].default,
-            "overlap": defaults["overlap"].default,
+            "max_input_tokens": embedding_provider.max_input_tokens,
+            "special_token_margin": SPECIAL_TOKEN_MARGIN,
+            "overlap_ratio": OVERLAP_RATIO,
         },
         "embedding_provider": type(embedding_provider).__name__,
         "dimension": embedding_provider.dimension,
@@ -297,8 +299,8 @@ def render(
     lines.append("Retrieval evaluation")
     lines.append("=" * 62)
     lines.append(
-        f"chunker         {config['chunker']['chunk_size']} chars / "
-        f"{config['chunker']['overlap']} overlap"
+        f"chunker         {config['chunker']['max_input_tokens']} token window / "
+        f"{config['chunker']['overlap_ratio']:.0%} overlap"
     )
     lines.append(
         f"embeddings      {config['embedding_provider']} "

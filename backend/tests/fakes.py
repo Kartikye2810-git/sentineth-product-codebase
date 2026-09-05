@@ -28,12 +28,23 @@ class FakeEmbeddingProvider(EmbeddingProvider):
     def __init__(
         self,
         dimension: int = 64,
+        max_input_tokens: int = 256,
     ) -> None:
         self._dimension = dimension
+        self._max_input_tokens = max_input_tokens
 
     @property
     def dimension(self) -> int:
         return self._dimension
+
+    @property
+    def max_input_tokens(self) -> int:
+        return self._max_input_tokens
+
+    def count_tokens(self, texts: list[str]) -> list[int]:
+        # This double's tokenizer is its word splitter, the same one its
+        # vectors are built from, so counts describe what it actually reads.
+        return [len(_WORD.findall(text.lower())) for text in texts]
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(text) for text in texts]
