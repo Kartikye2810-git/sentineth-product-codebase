@@ -17,11 +17,22 @@ def _build_context(chunks: list[dict]) -> str:
         document_id = payload.get("document_id") or chunk.get("document_id") or "unknown"
         chunk_id = payload.get("chunk_id") or chunk.get("chunk_id") or "unknown"
         chunk_index = payload.get("chunk_index") or chunk.get("chunk_index") or index
+        filename = payload.get("filename") or chunk.get("filename")
+        page_number = payload.get("page_number") or chunk.get("page_number")
+
+        # Named the way the answer should cite it. The model repeats what
+        # it is shown, so showing it "page 14" is what gets "page 14" into
+        # the answer instead of a chunk id no reader can act on.
+        located = f"{filename or document_id}"
+        if page_number is not None:
+            located += f", page {page_number}"
+
         context_parts.append(
             f"SOURCE {index}\n"
             f"Document: {document_id}\n"
             f"Chunk: {chunk_id}\n"
-            f"Chunk Index: {chunk_index}\n\n"
+            f"Chunk Index: {chunk_index}\n"
+            f"Cite as: {located}\n\n"
             f"{content.strip()}"
         )
 
@@ -83,6 +94,7 @@ async def answer_query(
         source = {
             "document_id": result.get("document_id"),
             "chunk_id": result.get("chunk_id"),
+            "page_number": result.get("page_number"),
             "filename": result.get("filename"),
             "chunk_index": result.get("chunk_index"),
             "score": result.get("score"),

@@ -12,8 +12,8 @@ from app.errors import (
 )
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.vector.base import VectorStore
-from app.services.chunking_service import chunk_text
-from app.services.extraction_service import extract_text_from_pdf
+from app.services.chunking_service import chunk_pages
+from app.services.extraction_service import extract_pages
 
 
 logger = logging.getLogger(__name__)
@@ -41,9 +41,10 @@ async def ingest_document(
                 "Only PDF documents are supported right now."
             )
 
-        # Extract text from the stored document.
+        # Extract text from the stored document, one entry per page, so a
+        # chunk can say which page it came from.
         try:
-            text = extract_text_from_pdf(
+            pages = extract_pages(
                 document.storage_path
             )
         except Exception as exc:
@@ -51,11 +52,17 @@ async def ingest_document(
                 "Could not read text from the document."
             ) from exc
 
+        if not any(page.strip() for page in pages):
+            raise ExtractionFailed(
+                "No extractable text found in the document. "
+                "It may be scanned or image-based."
+            )
+
         # Split extracted text into chunks the embedding provider can
         # read in full. The provider is passed in rather than consulted
         # later so the chunk size and the model that embeds it can never
         # be configured independently of each other.
-        chunks = chunk_text(text, embedding_provider)
+        chunks = chunk_pages(pages, embedding_provider)
 
         if not chunks:
             raise ExtractionFailed(
@@ -65,11 +72,12 @@ async def ingest_document(
         # Create database chunk records.
         document_chunks: list[DocumentChunk] = []
 
-        for index, content in enumerate(chunks):
+        for index, piece in enumerate(chunks):
             chunk = DocumentChunk(
                 document_id=document.id,
                 chunk_index=index,
-                content=content,
+                content=piece.content,
+                page_number=piece.page_number,
             )
 
             db.add(chunk)
@@ -113,6 +121,7 @@ async def ingest_document(
                     "document_id": str(document.id),
                     "chunk_id": str(chunk.id),
                     "chunk_index": chunk.chunk_index,
+                    "page_number": chunk.page_number,
                     "content": chunk.content,
                     "filename": document.filename,
                 }

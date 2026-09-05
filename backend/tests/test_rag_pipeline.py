@@ -5,9 +5,10 @@ using in-memory providers. These are the guardrails AGENTS.md section 34 asks
 for.
 """
 
+import pytest
 from sqlalchemy.orm import Session
 
-from tests.pdf_builder import build_pdf
+from tests.pdf_builder import build_pdf, build_pdf_pages
 
 
 REVENUE_PDF = build_pdf(
@@ -23,6 +24,16 @@ HIRING_PDF = build_pdf(
         "Sentineth hiring plan.",
         "We plan to hire two backend engineers in Q3.",
         "Recruiting is owned by the operations team.",
+    ]
+)
+
+# Three pages, and the answer is on the last one, so a citation reporting
+# page 1 fails rather than passing by coincidence.
+HANDBOOK_PDF = build_pdf_pages(
+    [
+        ["Sentineth engineering handbook.", "", "Introduction and scope."],
+        ["Chapter one covers the build system.", "", "Nothing else here."],
+        ["Chapter two covers deployment.", "", "Rollbacks are automatic."],
     ]
 )
 
@@ -418,3 +429,52 @@ def test_reindexing_an_unknown_document_is_a_404(client, organization):
         f"/organizations/{org_id}/documents/"
         "00000000-0000-0000-0000-000000000000/reindex"
     ).status_code == 404
+
+
+@pytest.mark.parametrize("embedding_provider", [20], indirect=True)
+def test_citation_carries_the_page_the_answer_came_from(
+    client, organization, llm_provider
+):
+    """A citation saying "page 3" is worth more than one saying "chunk 37",
+    and only if the 3 is right."""
+    org_id = organization()
+
+    assert upload(
+        client, org_id, "handbook.pdf", HANDBOOK_PDF
+    ).status_code == 200
+
+    response = client.post(
+        f"/organizations/{org_id}/query",
+        json={"query": "Are rollbacks automatic after deployment?"},
+    )
+
+    assert response.status_code == 200, response.text
+    sources = response.json()["sources"]
+
+    assert sources
+    assert sources[0]["page_number"] == 3
+
+    # The model is told which page to cite, not just handed the text.
+    context = llm_provider.calls[0][1]["content"]
+    assert "handbook.pdf, page 3" in context
+
+
+@pytest.mark.parametrize("embedding_provider", [20], indirect=True)
+def test_search_results_carry_page_numbers(client, organization):
+    org_id = organization()
+
+    assert upload(
+        client, org_id, "handbook.pdf", HANDBOOK_PDF
+    ).status_code == 200
+
+    response = client.post(
+        f"/organizations/{org_id}/search",
+        json={"query": "deployment rollbacks"},
+    )
+
+    assert response.status_code == 200, response.text
+    results = response.json()["results"]
+
+    assert results
+    assert {result["page_number"] for result in results} <= {1, 2, 3}
+    assert any(result["page_number"] == 3 for result in results)

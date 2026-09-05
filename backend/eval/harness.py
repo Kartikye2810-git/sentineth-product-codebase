@@ -4,7 +4,7 @@ Answers one question: for a hand-written question whose answer is known to
 live in a particular passage of a particular document, does the retrieval
 stack actually return that passage, and at what rank?
 
-What it measures is the real path - `extract_text_from_pdf`, `chunk_text`,
+What it measures is the real path - `extract_pages`, `chunk_pages`,
 the configured `EmbeddingProvider`, and the configured `VectorStore` - so a
 change to any of them shows up here without the harness being edited. It
 deliberately stops before the LLM: the answer step cannot be scored without
@@ -46,9 +46,12 @@ from app.providers.vector.qdrant import QdrantVectorStore  # noqa: E402
 from app.services.chunking_service import (  # noqa: E402
     OVERLAP_RATIO,
     SPECIAL_TOKEN_MARGIN,
-    chunk_text,
+    chunk_pages,
 )
-from app.services.extraction_service import extract_text_from_pdf  # noqa: E402
+from app.services.extraction_service import (  # noqa: E402
+    extract_pages,
+    extract_text_from_pdf,
+)
 
 
 DEFAULT_QUESTIONS = EVAL_DIR / "questions.jsonl"
@@ -182,13 +185,13 @@ async def index_corpus(
 
     for pdf in sorted(corpus.glob("*.pdf")):
         doc = pdf.stem
-        chunks = chunk_text(extract_text_from_pdf(str(pdf)), embedding_provider)
+        chunks = chunk_pages(extract_pages(str(pdf)), embedding_provider)
 
         if not chunks:
             counts[doc] = 0
             continue
 
-        vectors = await embedding_provider.embed(chunks)
+        vectors = await embedding_provider.embed([chunk.content for chunk in chunks])
 
         payloads: list[dict[str, Any]] = [
             {
@@ -196,10 +199,11 @@ async def index_corpus(
                 "document_id": doc,
                 "chunk_id": f"{doc}:{index}",
                 "chunk_index": index,
-                "content": content,
+                "page_number": chunk.page_number,
+                "content": chunk.content,
                 "filename": f"{doc}.pdf",
             }
-            for index, content in enumerate(chunks)
+            for index, chunk in enumerate(chunks)
         ]
 
         await vector_store.upsert(
@@ -274,7 +278,7 @@ def configuration(embedding_provider: EmbeddingProvider) -> dict[str, Any]:
     """Record the settings that produced a number, so runs stay comparable."""
     return {
         "chunker": {
-            "function": f"{chunk_text.__module__}.{chunk_text.__name__}",
+            "function": f"{chunk_pages.__module__}.{chunk_pages.__name__}",
             "max_input_tokens": embedding_provider.max_input_tokens,
             "special_token_margin": SPECIAL_TOKEN_MARGIN,
             "overlap_ratio": OVERLAP_RATIO,

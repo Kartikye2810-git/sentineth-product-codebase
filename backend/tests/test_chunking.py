@@ -1,6 +1,10 @@
 import pytest
 
-from app.services.chunking_service import SPECIAL_TOKEN_MARGIN, chunk_text
+from app.services.chunking_service import (
+    SPECIAL_TOKEN_MARGIN,
+    chunk_pages,
+    chunk_text,
+)
 from tests.fakes import FakeEmbeddingProvider
 
 
@@ -89,3 +93,49 @@ def test_a_word_larger_than_the_window_is_emitted_rather_than_looped_on():
 def test_window_too_small_to_chunk_is_rejected():
     with pytest.raises(ValueError):
         chunk_text("some text", FakeEmbeddingProvider(max_input_tokens=SPECIAL_TOKEN_MARGIN))
+
+
+def test_chunks_do_not_begin_mid_sentence(provider):
+    """A chunk that starts on a fragment is embedded and shown as if it were
+    a statement. Splitting on the document's own boundaries is what stops
+    that."""
+    paragraphs = [
+        " ".join(f"alpha{n}" for n in range(12)) + ".",
+        " ".join(f"beta{n}" for n in range(12)) + ".",
+        " ".join(f"gamma{n}" for n in range(12)) + ".",
+        " ".join(f"delta{n}" for n in range(12)) + ".",
+    ]
+
+    chunks = chunk_pages(["\n\n".join(paragraphs)], provider)
+
+    assert len(chunks) > 1
+
+    starts = {paragraph.split()[0] for paragraph in paragraphs}
+    for chunk in chunks:
+        assert chunk.content.split()[0] in starts
+
+
+def test_page_number_is_the_page_the_chunk_starts_on(provider):
+    pages = [
+        "first page content here.",
+        "second page content here.",
+        "third page content here.",
+    ]
+
+    chunks = chunk_pages(pages, FakeEmbeddingProvider(max_input_tokens=8))
+
+    assert [chunk.page_number for chunk in chunks] == [1, 2, 3]
+    assert chunks[1].content.startswith("second")
+
+
+def test_blank_pages_do_not_shift_the_numbering(provider):
+    chunks = chunk_pages(["", "", "content on the third page"], provider)
+
+    assert [chunk.page_number for chunk in chunks] == [3]
+
+
+def test_paragraph_breaks_survive_into_the_chunk(provider):
+    chunks = chunk_pages(["one two three.\n\nfour five six."], provider)
+
+    assert len(chunks) == 1
+    assert "\n\n" in chunks[0].content
