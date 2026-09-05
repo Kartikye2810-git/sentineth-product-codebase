@@ -51,6 +51,17 @@ class QdrantVectorStore(VectorStore):
                 ),
             )
 
+        # Outside the create branch on purpose: a collection that predates
+        # this index needs it too, and re-issuing an identical index is a
+        # no-op. Without it, every tenant-scoped search filters by scanning,
+        # so one organization's latency grows with every other organization's
+        # data.
+        self._client.create_payload_index(
+            self.collection_name,
+            field_name="organization_id",
+            field_schema=qmodels.PayloadSchemaType.KEYWORD,
+        )
+
     def _build_point_id(
         self,
         organization_id: str,
