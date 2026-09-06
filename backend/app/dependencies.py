@@ -26,6 +26,8 @@ from app.providers.embeddings.local import LocalEmbeddingProvider
 from app.providers.embeddings.nvidia import NvidiaEmbeddingProvider
 from app.providers.llm.base import LLMProvider
 from app.providers.llm.openrouter import OpenRouterProvider
+from app.providers.rerank.base import RerankProvider
+from app.providers.rerank.local import LocalRerankProvider
 from app.providers.storage.base import StorageProvider
 from app.providers.storage.local import LocalStorageProvider
 from app.providers.vector.base import VectorStore
@@ -89,15 +91,35 @@ def get_vector_store() -> VectorStore:
             "sentineth_documents",
         ),
         vector_size=dimension,
+        # Like the dimension, this is fixed when the collection is created
+        # and cannot be added later, so changing it is a reindex into a new
+        # collection rather than a setting that takes effect on restart.
+        hybrid=os.getenv("QDRANT_HYBRID", "").strip().lower() in {"1", "true", "yes"},
     )
 
     logger.info(
-        "Vector store ready: collection=%s dimension=%s",
+        "Vector store ready: collection=%s dimension=%s hybrid=%s",
         store.collection_name,
         dimension,
+        store.hybrid,
     )
 
     return store
+
+
+@lru_cache(maxsize=1)
+def get_rerank_provider() -> RerankProvider | None:
+    # Off unless asked for. It loads a second model into the process and
+    # adds a forward pass per candidate to every search, so it should be
+    # switched on by someone who has seen it pay for that.
+    if os.getenv("RERANK", "").strip().lower() not in {"1", "true", "yes"}:
+        return None
+
+    provider = LocalRerankProvider()
+
+    logger.info("Rerank provider ready: %s", type(provider).__name__)
+
+    return provider
 
 
 @lru_cache(maxsize=1)
@@ -132,5 +154,6 @@ def reset_provider_cache() -> None:
     """
     get_embedding_provider.cache_clear()
     get_vector_store.cache_clear()
+    get_rerank_provider.cache_clear()
     get_storage_provider.cache_clear()
     _build_llm_provider.cache_clear()

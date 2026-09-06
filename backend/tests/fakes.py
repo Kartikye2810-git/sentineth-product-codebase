@@ -93,10 +93,16 @@ class FakeVectorStore(VectorStore):
         organization_id: str,
         vectors: list[list[float]],
         payloads: list[dict[str, Any]],
+        sparse_vectors: list[tuple[list[int], list[float]]] | None = None,
     ) -> None:
         if len(vectors) != len(payloads):
             raise ValueError(
                 "vectors and payloads must have matching lengths."
+            )
+
+        if sparse_vectors is not None and len(sparse_vectors) != len(vectors):
+            raise ValueError(
+                "sparse_vectors and vectors must have matching lengths."
             )
 
         org_id = str(organization_id)
@@ -110,8 +116,15 @@ class FakeVectorStore(VectorStore):
                 f"{stored_payload.get('chunk_id', index)}"
             )
 
+            sparse = None
+
+            if sparse_vectors is not None:
+                indices, values = sparse_vectors[index]
+                sparse = dict(zip(indices, values, strict=True))
+
             self.points[point_id] = {
                 "vector": list(vector),
+                "sparse": sparse,
                 "payload": stored_payload,
             }
 
@@ -120,33 +133,88 @@ class FakeVectorStore(VectorStore):
         organization_id: str,
         query_vector: list[float],
         limit: int = 5,
+        sparse_query: tuple[list[int], list[float]] | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
 
         org_id = str(organization_id)
-        scored: list[tuple[float, str, dict[str, Any]]] = []
 
-        for point_id, point in self.points.items():
-            if point["payload"].get("organization_id") != org_id:
-                continue
+        mine = {
+            point_id: point
+            for point_id, point in self.points.items()
+            if point["payload"].get("organization_id") == org_id
+        }
 
-            score = sum(
+        dense = self._rank(
+            mine,
+            lambda point: sum(
                 a * b
                 for a, b in zip(query_vector, point["vector"], strict=True)
-            )
-            scored.append((score, point_id, point))
+            ),
+        )
 
-        scored.sort(key=lambda row: row[0], reverse=True)
+        if sparse_query is None:
+            ranked = dense
+        else:
+            indices, values = sparse_query
+            query_terms = dict(zip(indices, values, strict=True))
+
+            sparse = self._rank(
+                mine,
+                lambda point: sum(
+                    weight * (point["sparse"] or {}).get(term, 0.0)
+                    for term, weight in query_terms.items()
+                ),
+            )
+            ranked = self._fuse(dense, sparse)
 
         return [
             {
                 "id": point_id,
                 "score": float(score),
-                "payload": dict(point["payload"]),
+                "payload": dict(mine[point_id]["payload"]),
             }
-            for score, point_id, point in scored[:limit]
+            for point_id, score in ranked[:limit]
         ]
+
+    @staticmethod
+    def _rank(
+        points: dict[str, dict[str, Any]],
+        score: Any,
+    ) -> list[tuple[str, float]]:
+        # Zero-scoring points are dropped rather than ranked last. A
+        # lexical retriever that shares no term with the query has not
+        # found a weak match, it has found nothing, and fusing it in as a
+        # ranked result would hand it credit for the ordering it inherited.
+        scored = [
+            (point_id, score(point))
+            for point_id, point in points.items()
+        ]
+
+        return sorted(
+            (row for row in scored if row[1] > 0),
+            key=lambda row: row[1],
+            reverse=True,
+        )
+
+    @staticmethod
+    def _fuse(*rankings: list[tuple[str, float]]) -> list[tuple[str, float]]:
+        """Reciprocal rank fusion, matching Qdrant's constant.
+
+        Qdrant uses k=2 over zero-indexed ranks - checked against a live
+        collection, where a point ranked first in one list and second in
+        the other scored 1/2 + 1/3 = 0.8333. Guessing the textbook k=60
+        here would make the double agree with the real store on which
+        chunks come back but not on their order.
+        """
+        fused: dict[str, float] = {}
+
+        for ranking in rankings:
+            for rank, (point_id, _) in enumerate(ranking):
+                fused[point_id] = fused.get(point_id, 0.0) + 1 / (2 + rank)
+
+        return sorted(fused.items(), key=lambda row: row[1], reverse=True)
 
     async def delete_document(self, organization_id: str, document_id: str) -> None:
         for point_id, point in list(self.points.items()):

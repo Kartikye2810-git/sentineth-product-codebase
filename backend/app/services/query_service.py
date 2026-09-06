@@ -2,6 +2,7 @@ from uuid import UUID
 
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.llm.base import LLMProvider
+from app.providers.rerank.base import RerankProvider
 from app.providers.vector.base import VectorStore
 from app.services.retrieval_service import retrieve
 
@@ -46,6 +47,7 @@ async def answer_query(
     vector_store: VectorStore,
     llm_provider: LLMProvider,
     limit: int = 5,
+    rerank_provider: RerankProvider | None = None,
 ) -> dict:
     if not query or not query.strip():
         raise ValueError("Query cannot be empty.")
@@ -61,6 +63,7 @@ async def answer_query(
         embedding_provider=embedding_provider,
         vector_store=vector_store,
         limit=limit,
+        rerank_provider=rerank_provider,
     )
 
     if not results:

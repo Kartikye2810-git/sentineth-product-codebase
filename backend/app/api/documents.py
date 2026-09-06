@@ -10,12 +10,14 @@ from app.db.models import Document
 from app.dependencies import (
     get_embedding_provider,
     get_llm_provider,
+    get_rerank_provider,
     get_storage_provider,
     get_vector_store,
 )
 from app.errors import DocumentProcessingError
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.llm.base import LLMProvider
+from app.providers.rerank.base import RerankProvider
 from app.providers.storage.base import StorageProvider
 from app.providers.vector.base import VectorStore
 from app.schemas import (
@@ -158,6 +160,9 @@ async def search_documents(
     vector_store: VectorStore = Depends(
         get_vector_store
     ),
+    rerank_provider: RerankProvider | None = Depends(
+        get_rerank_provider
+    ),
 ):
     try:
         results = await retrieve(
@@ -166,6 +171,7 @@ async def search_documents(
             embedding_provider=embedding_provider,
             vector_store=vector_store,
             limit=payload.limit,
+            rerank_provider=rerank_provider,
         )
 
     except ValueError as exc:
@@ -210,6 +216,9 @@ async def query_documents(
     llm_provider: LLMProvider = Depends(
         get_llm_provider
     ),
+    rerank_provider: RerankProvider | None = Depends(
+        get_rerank_provider
+    ),
 ):
     try:
         result = await answer_query(
@@ -218,6 +227,7 @@ async def query_documents(
             embedding_provider=embedding_provider,
             vector_store=vector_store,
             llm_provider=llm_provider,
+            rerank_provider=rerank_provider,
             limit=payload.limit,
         )
 

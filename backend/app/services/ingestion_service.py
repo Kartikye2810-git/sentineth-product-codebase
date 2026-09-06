@@ -14,6 +14,7 @@ from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.vector.base import VectorStore
 from app.services.chunking_service import chunk_pages
 from app.services.extraction_service import extract_pages
+from app.services.lexical_service import encode_passage
 
 
 logger = logging.getLogger(__name__)
@@ -128,12 +129,24 @@ async def ingest_document(
                 }
             )
 
+        # Lexical vectors only when the collection has somewhere to put
+        # them. Sending them to a dense-only collection is an error, not a
+        # no-op, because it means the two sides disagree about what this
+        # index is.
+        sparse_vectors = None
+
+        if vector_store.hybrid:
+            sparse_vectors = [
+                encode_passage(chunk.content) for chunk in document_chunks
+            ]
+
         # Store embeddings in Qdrant.
         try:
             await vector_store.upsert(
                 organization_id=organization_id,
                 vectors=embeddings,
                 payloads=payloads,
+                sparse_vectors=sparse_vectors,
             )
         except Exception as exc:
             raise ProviderUnavailable(

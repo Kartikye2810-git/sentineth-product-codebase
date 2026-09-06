@@ -47,6 +47,8 @@ load_dotenv(BACKEND_DIR.parent / ".env")
 
 from app.dependencies import EMBEDDING_PROVIDERS  # noqa: E402
 from app.providers.embeddings.base import EmbeddingProvider  # noqa: E402
+from app.providers.rerank.base import RerankProvider  # noqa: E402
+from app.providers.rerank.local import LocalRerankProvider  # noqa: E402
 from app.providers.vector.base import VectorStore  # noqa: E402
 from app.providers.vector.qdrant import QdrantVectorStore  # noqa: E402
 from app.services.chunking_service import (  # noqa: E402
@@ -58,6 +60,8 @@ from app.services.extraction_service import (  # noqa: E402
     extract_pages,
     extract_text_from_pdf,
 )
+from app.services.lexical_service import encode_passage  # noqa: E402
+from app.services.retrieval_service import RERANK_DEPTH, retrieve  # noqa: E402
 
 
 DEFAULT_QUESTIONS = EVAL_DIR / "questions.jsonl"
@@ -225,6 +229,11 @@ async def index_corpus(
             organization_id=organization_id,
             vectors=vectors,
             payloads=payloads,
+            sparse_vectors=(
+                [encode_passage(chunk.content) for chunk in chunks]
+                if vector_store.hybrid
+                else None
+            ),
         )
 
         counts[doc] = len(chunks)
@@ -238,21 +247,23 @@ async def run_questions(
     embedding_provider: EmbeddingProvider,
     vector_store: VectorStore,
     depth: int = SEARCH_DEPTH,
+    rerank_provider: RerankProvider | None = None,
 ) -> list[Result]:
     results: list[Result] = []
 
     for question in questions:
-        query_vector = (
-            await embedding_provider.embed(
-                [question.question],
-                input_type="query",
-            )
-        )[0]
-
-        hits = await vector_store.search(
+        # Through retrieve() rather than reaching for the store directly.
+        # The harness exists to predict what the application does, and it
+        # can only do that if it takes the same path - reimplementing the
+        # fetch-wider-then-rerank order here would eventually measure a
+        # pipeline nobody ships.
+        hits = await retrieve(
             organization_id=organization_id,
-            query_vector=query_vector,
+            query=question.question,
+            embedding_provider=embedding_provider,
+            vector_store=vector_store,
             limit=depth,
+            rerank_provider=rerank_provider,
         )
 
         span = normalise(question.answer_span)
@@ -260,15 +271,14 @@ async def run_questions(
         retrieved: list[str] = []
 
         for position, hit in enumerate(hits, start=1):
-            payload = hit.get("payload") or {}
-            doc = str(payload.get("document_id", ""))
+            doc = str(hit.get("document_id", ""))
             retrieved.append(doc)
 
             # A hit is the right document AND the passage that answers it.
             # Document-level matching would score a policy question correct
             # for retrieving any chunk of a sixty-page policy.
             if rank is None and doc == question.doc:
-                if span in normalise(str(payload.get("content", ""))):
+                if span in normalise(str(hit.get("content", ""))):
                     rank = position
 
         results.append(Result(question=question, rank=rank, retrieved=retrieved))
@@ -298,6 +308,8 @@ def configuration(
     embedding_provider: EmbeddingProvider,
     max_chunk_tokens: int | None = None,
     chunk_provider: EmbeddingProvider | None = None,
+    hybrid: bool = False,
+    rerank_provider: RerankProvider | None = None,
 ) -> dict[str, Any]:
     """Record the settings that produced a number, so runs stay comparable."""
     counter = chunk_provider or embedding_provider
@@ -322,6 +334,15 @@ def configuration(
         "embedding_provider": type(embedding_provider).__name__,
         "dimension": embedding_provider.dimension,
         "search_depth": SEARCH_DEPTH,
+        "retrieval": "hybrid" if hybrid else "dense",
+        "rerank": (
+            {
+                "provider": type(rerank_provider).__name__,
+                "depth": RERANK_DEPTH,
+            }
+            if rerank_provider is not None
+            else None
+        ),
     }
 
 
@@ -346,6 +367,15 @@ def render(
     lines.append(
         f"embeddings      {config['embedding_provider']} "
         f"({config['dimension']} dimensions)"
+    )
+    rerank = config.get("rerank")
+    lines.append(
+        f"retrieval       {config.get('retrieval', 'dense')}"
+        + (
+            f" + rerank top {rerank['depth']} ({rerank['provider']})"
+            if rerank
+            else ", no rerank"
+        )
     )
     lines.append(
         f"corpus          {len(chunk_counts)} documents, "
@@ -429,7 +459,12 @@ async def main_async(args: argparse.Namespace) -> int:
     vector_store: VectorStore = QdrantVectorStore(
         collection_name=args.collection,
         vector_size=embedding_provider.dimension,
+        hybrid=args.hybrid,
     )
+
+    # Constructed once, outside the question loop: it loads a model, and
+    # paying for that 102 times would be timing the loader.
+    rerank_provider = LocalRerankProvider() if args.rerank else None
 
     # Every run gets its own organisation id inside a collection that was just
     # dropped, so a run can never score against vectors left by the previous
@@ -460,11 +495,16 @@ async def main_async(args: argparse.Namespace) -> int:
         organization_id,
         embedding_provider,
         vector_store,
+        rerank_provider=rerank_provider,
     )
 
     metrics = score(results)
     config = configuration(
-        embedding_provider, args.max_chunk_tokens, chunk_provider
+        embedding_provider,
+        args.max_chunk_tokens,
+        chunk_provider,
+        hybrid=vector_store.hybrid,
+        rerank_provider=rerank_provider,
     )
     elapsed = time.monotonic() - started
 
@@ -551,6 +591,16 @@ def main() -> int:
             "model and a 32k-token one otherwise get different chunks as "
             "well as different embeddings, and the delta means nothing."
         ),
+    )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="index and search a lexical vector beside the dense one",
+    )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help=f"re-score the top {RERANK_DEPTH} with a cross-encoder",
     )
     parser.add_argument("--report", type=Path, help="write a JSON report here")
     parser.add_argument(

@@ -50,6 +50,7 @@ from app.db.models import Document, DocumentChunk  # noqa: E402
 from app.dependencies import EMBEDDING_PROVIDERS  # noqa: E402
 from app.providers.embeddings.base import EmbeddingProvider  # noqa: E402
 from app.providers.vector.qdrant import QdrantVectorStore  # noqa: E402
+from app.services.lexical_service import encode_passage  # noqa: E402
 
 
 # Matched to the NVIDIA endpoint's maximum batch, so a database page turns
@@ -123,10 +124,19 @@ async def reindex(
                 by_org.setdefault(str(document.organization_id), []).append(offset)
 
             for organization_id, offsets in by_org.items():
+                sparse = None
+
+                if store.hybrid:
+                    sparse = [
+                        encode_passage(batch[offset][0].content)
+                        for offset in offsets
+                    ]
+
                 await store.upsert(
                     organization_id=organization_id,
                     vectors=[vectors[offset] for offset in offsets],
                     payloads=[payload_for(*batch[offset]) for offset in offsets],
+                    sparse_vectors=sparse,
                 )
 
         written += len(batch)
@@ -169,10 +179,11 @@ async def main_async(args: argparse.Namespace) -> int:
     store = QdrantVectorStore(
         collection_name=args.collection,
         vector_size=provider.dimension,
+        hybrid=args.hybrid,
     )
 
     print(f"provider    {type(provider).__name__} ({provider.dimension} dims)")
-    print(f"collection  {args.collection}")
+    print(f"collection  {args.collection} ({'hybrid' if store.hybrid else 'dense only'})")
     print(f"qdrant      {store.url}")
 
     session = SessionLocal()
@@ -212,6 +223,14 @@ def main() -> None:
         "--collection",
         required=True,
         help="target Qdrant collection; must not be the one being served",
+    )
+    parser.add_argument(
+        "--hybrid",
+        action="store_true",
+        help=(
+            "build a lexical index beside the dense one; must match the "
+            "QDRANT_HYBRID the application will read this collection with"
+        ),
     )
     parser.add_argument(
         "--dry-run",
