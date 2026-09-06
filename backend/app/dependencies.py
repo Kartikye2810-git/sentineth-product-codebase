@@ -15,6 +15,7 @@ from scripts and background jobs, not just from request handlers.
 """
 
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from fastapi import HTTPException
 
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.embeddings.local import LocalEmbeddingProvider
+from app.providers.embeddings.nvidia import NvidiaEmbeddingProvider
 from app.providers.llm.base import LLMProvider
 from app.providers.llm.openrouter import OpenRouterProvider
 from app.providers.storage.base import StorageProvider
@@ -39,9 +41,28 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 STORAGE_DIR = BACKEND_DIR / "storage" / "documents"
 
 
+EMBEDDING_PROVIDERS = {
+    "local": LocalEmbeddingProvider,
+    "nvidia": NvidiaEmbeddingProvider,
+}
+
+
 @lru_cache(maxsize=1)
 def get_embedding_provider() -> EmbeddingProvider:
-    provider = LocalEmbeddingProvider()
+    # Selected by environment because switching embedding models means
+    # rebuilding every vector, and the safe way to do that is to build the
+    # new collection alongside the old one and change which one the process
+    # reads. That makes the cutover - and the rollback - a restart with a
+    # different value here, not a deploy. See scripts/reindex.py.
+    name = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+
+    if name not in EMBEDDING_PROVIDERS:
+        raise ValueError(
+            f"Unknown EMBEDDING_PROVIDER {name!r}. "
+            f"Expected one of: {', '.join(sorted(EMBEDDING_PROVIDERS))}."
+        )
+
+    provider = EMBEDDING_PROVIDERS[name]()
 
     logger.info(
         "Embedding provider ready: %s (dimension=%s)",
@@ -58,7 +79,15 @@ def get_vector_store() -> VectorStore:
     # instead of hardcoding it, so the two can never drift apart.
     dimension = get_embedding_provider().dimension
 
+    # One collection per embedding model, because a collection's vector
+    # size is fixed at creation and 384-dimension vectors cannot live
+    # beside 2048-dimension ones. Keeping them separate is also what makes
+    # the rollback free: the old collection is still there, still correct.
     store = QdrantVectorStore(
+        collection_name=os.getenv(
+            "QDRANT_COLLECTION",
+            "sentineth_documents",
+        ),
         vector_size=dimension,
     )
 

@@ -478,3 +478,28 @@ def test_search_results_carry_page_numbers(client, organization):
     assert results
     assert {result["page_number"] for result in results} <= {1, 2, 3}
     assert any(result["page_number"] == 3 for result in results)
+
+
+def test_indexing_embeds_passages_and_searching_embeds_queries(
+    client, organization, embedding_provider
+):
+    """An asymmetric model gives worse answers, silently, if these are mixed.
+
+    MiniLM does not care, so nothing in the running system would notice the
+    day the provider is swapped for one that does. Asserted here because
+    there is no downstream symptom to assert on.
+    """
+    org_id = organization()
+
+    assert upload(client, org_id, "revenue.pdf", REVENUE_PDF).status_code == 200
+    assert embedding_provider.input_types == ["passage"]
+
+    embedding_provider.input_types.clear()
+
+    response = client.post(
+        f"/organizations/{org_id}/search",
+        json={"query": "what is the revenue target"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert embedding_provider.input_types == ["query"]

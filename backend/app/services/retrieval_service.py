@@ -20,7 +20,12 @@ async def retrieve(
     if limit > max_limit:
         raise ValueError(f"Limit cannot exceed {max_limit}.")
 
-    query_vector = (await embedding_provider.embed([query.strip()]))[0]
+    query_vector = (
+        await embedding_provider.embed(
+            [query.strip()],
+            input_type="query",
+        )
+    )[0]
     results = await vector_store.search(
         organization_id=str(organization_id),
         query_vector=query_vector,

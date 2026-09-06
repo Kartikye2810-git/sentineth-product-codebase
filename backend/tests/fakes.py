@@ -10,7 +10,7 @@ import re
 import zlib
 from typing import Any
 
-from app.providers.embeddings.base import EmbeddingProvider
+from app.providers.embeddings.base import EmbeddingProvider, InputType
 from app.providers.llm.base import LLMProvider
 from app.providers.vector.base import VectorStore
 
@@ -32,6 +32,7 @@ class FakeEmbeddingProvider(EmbeddingProvider):
     ) -> None:
         self._dimension = dimension
         self._max_input_tokens = max_input_tokens
+        self.input_types: list[InputType] = []
 
     @property
     def dimension(self) -> int:
@@ -41,12 +42,28 @@ class FakeEmbeddingProvider(EmbeddingProvider):
     def max_input_tokens(self) -> int:
         return self._max_input_tokens
 
+    @property
+    def chunk_tokens(self) -> int:
+        # The window, so tests that shrink the window to force a document
+        # across several chunks still control chunk count with one knob.
+        return self._max_input_tokens
+
     def count_tokens(self, texts: list[str]) -> list[int]:
         # This double's tokenizer is its word splitter, the same one its
         # vectors are built from, so counts describe what it actually reads.
         return [len(_WORD.findall(text.lower())) for text in texts]
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        input_type: InputType,
+    ) -> list[list[float]]:
+        # Recorded rather than ignored: an asymmetric provider is only
+        # correct if indexing says "passage" and searching says "query",
+        # and a test can assert that here without a network call.
+        self.input_types.append(input_type)
+
         return [self._vector(text) for text in texts]
 
     def _vector(self, text: str) -> list[float]:

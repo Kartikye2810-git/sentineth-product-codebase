@@ -68,6 +68,40 @@ def test_chunk_size_follows_the_provider_not_a_constant():
     assert len(large) < len(small)
 
 
+class LongWindowProvider(FakeEmbeddingProvider):
+    """A model that will read far more than it should be asked to.
+
+    nemotron-3-embed-1b, in miniature: a 32,768-token window against
+    MiniLM's 256. Nothing rejects a chunk that size, which is what makes
+    it dangerous.
+    """
+
+    @property
+    def max_input_tokens(self) -> int:
+        return 32768
+
+    @property
+    def chunk_tokens(self) -> int:
+        return 20
+
+
+def test_chunk_size_follows_the_budget_not_the_window():
+    """A 32k window is not a 32k chunk.
+
+    Sizing to the window was right while the window was 256. Applied to a
+    long-context model it silently produces one chunk per document: it
+    embeds without error, retrieval returns whole documents, and a
+    citation points at everything. The failure has no symptom at
+    ingestion time, so the test has to be here.
+    """
+    text = " ".join(f"word{n}" for n in range(400))
+
+    chunks = chunk_text(text, LongWindowProvider())
+
+    assert len(chunks) > 1
+    assert max(LongWindowProvider().count_tokens(chunks)) <= 20
+
+
 class CharTokenProvider(FakeEmbeddingProvider):
     """A provider whose tokens are characters.
 

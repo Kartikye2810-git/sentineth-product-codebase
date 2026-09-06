@@ -95,7 +95,8 @@ async def ingest_document(
 
         try:
             embeddings = await embedding_provider.embed(
-                chunk_texts
+                chunk_texts,
+                input_type="passage",
             )
         except Exception as exc:
             raise ProviderUnavailable(

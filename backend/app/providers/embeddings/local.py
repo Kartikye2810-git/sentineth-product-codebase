@@ -1,6 +1,6 @@
 import logging
 
-from app.providers.embeddings.base import EmbeddingProvider
+from app.providers.embeddings.base import EmbeddingProvider, InputType
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,11 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         # a stale 256 behind.
         return int(self._model.max_seq_length)
 
+    @property
+    def chunk_tokens(self) -> int:
+        # The whole window: at 256 the model is still the constraint.
+        return self.max_input_tokens
+
     def count_tokens(self, texts: list[str]) -> list[int]:
         if not texts:
             return []
@@ -40,7 +45,14 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     async def embed(
         self,
         texts: list[str],
+        *,
+        input_type: InputType,
     ) -> list[list[float]]:
+        # MiniLM is symmetric: it was trained with the same encoder for
+        # both sides, so there is nothing to switch on. Accepted and
+        # ignored so call sites can stay honest about what they hold.
+        del input_type
+
         if not texts:
             return []
 

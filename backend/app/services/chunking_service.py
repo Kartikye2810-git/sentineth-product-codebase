@@ -89,6 +89,8 @@ def _split_units(pages: list[str], budget: int, provider: EmbeddingProvider) -> 
 def chunk_pages(
     pages: list[str],
     provider: EmbeddingProvider,
+    *,
+    max_tokens: int | None = None,
 ) -> list[Chunk]:
     """Split a document into chunks the provider can embed without truncating.
 
@@ -105,15 +107,27 @@ def chunk_pages(
     means nothing on its own, and it is embedded, retrieved and shown to a
     user as though it did.
     """
-    # The whole window, not a fraction of it. eval/harness.py was swept
-    # across targets from 120 to 252 tokens and recall@5 moved between
-    # 76.5% and 82.4% with no trend - neighbouring targets disagreed as
-    # much as distant ones, so the differences are where the chunk
-    # boundaries happened to fall, not a preference the data supports.
-    # With nothing to tune towards, take the whole window: it needs no
-    # constant to keep true, and it gives the answering model the most
-    # context per citation. Retune only against a harness run.
-    budget = provider.max_input_tokens - SPECIAL_TOKEN_MARGIN
+    # The provider's own budget by default, not a constant here, and not
+    # its window either. Those were the same number while the window was
+    # MiniLM's 256 and the model was the binding constraint; they are not
+    # at 32k, where a legal chunk is a whole document and a citation
+    # points a reader at nothing in particular.
+    #
+    # Within the range the harness has measured the size barely matters:
+    # sweeping 120 to 252 tokens moved recall@5 between 76.5% and 82.4%
+    # with no trend, neighbouring targets disagreeing as much as distant
+    # ones. So the number is not tuned for retrieval, because there is no
+    # retrieval signal to tune towards - it is picked for citation size,
+    # and it lives on the provider so it stays next to the window it has
+    # to respect.
+    #
+    # `max_tokens` overrides it, for the harness sweeping sizes on
+    # purpose. Clamped to the window either way: no caller gets to ask for
+    # more than the model will read, which is the defect this whole
+    # function exists to make impossible.
+    ceiling = min(max_tokens or provider.chunk_tokens, provider.max_input_tokens)
+
+    budget = ceiling - SPECIAL_TOKEN_MARGIN
 
     if budget < 1:
         raise ValueError(
@@ -186,6 +200,11 @@ def _join(units: list[_Unit]) -> Chunk:
 def chunk_text(
     text: str,
     provider: EmbeddingProvider,
+    *,
+    max_tokens: int | None = None,
 ) -> list[str]:
     """Chunk text with no page structure. Content only, no page numbers."""
-    return [chunk.content for chunk in chunk_pages([text], provider)]
+    return [
+        chunk.content
+        for chunk in chunk_pages([text], provider, max_tokens=max_tokens)
+    ]

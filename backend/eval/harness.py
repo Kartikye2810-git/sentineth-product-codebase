@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 
 EVAL_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = EVAL_DIR.parent
@@ -39,8 +41,12 @@ BACKEND_DIR = EVAL_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+# Hosted providers need their keys, and the harness is run from a shell that
+# has not sourced anything. Same file the application reads.
+load_dotenv(BACKEND_DIR.parent / ".env")
+
+from app.dependencies import EMBEDDING_PROVIDERS  # noqa: E402
 from app.providers.embeddings.base import EmbeddingProvider  # noqa: E402
-from app.providers.embeddings.local import LocalEmbeddingProvider  # noqa: E402
 from app.providers.vector.base import VectorStore  # noqa: E402
 from app.providers.vector.qdrant import QdrantVectorStore  # noqa: E402
 from app.services.chunking_service import (  # noqa: E402
@@ -179,19 +185,28 @@ async def index_corpus(
     organization_id: str,
     embedding_provider: EmbeddingProvider,
     vector_store: VectorStore,
+    max_chunk_tokens: int | None = None,
+    chunk_provider: EmbeddingProvider | None = None,
 ) -> dict[str, int]:
     """Extract, chunk, embed and upsert every PDF. Returns chunks per document."""
     counts: dict[str, int] = {}
 
     for pdf in sorted(corpus.glob("*.pdf")):
         doc = pdf.stem
-        chunks = chunk_pages(extract_pages(str(pdf)), embedding_provider)
+        chunks = chunk_pages(
+            extract_pages(str(pdf)),
+            chunk_provider or embedding_provider,
+            max_tokens=max_chunk_tokens,
+        )
 
         if not chunks:
             counts[doc] = 0
             continue
 
-        vectors = await embedding_provider.embed([chunk.content for chunk in chunks])
+        vectors = await embedding_provider.embed(
+            [chunk.content for chunk in chunks],
+            input_type="passage",
+        )
 
         payloads: list[dict[str, Any]] = [
             {
@@ -227,7 +242,12 @@ async def run_questions(
     results: list[Result] = []
 
     for question in questions:
-        query_vector = (await embedding_provider.embed([question.question]))[0]
+        query_vector = (
+            await embedding_provider.embed(
+                [question.question],
+                input_type="query",
+            )
+        )[0]
 
         hits = await vector_store.search(
             organization_id=organization_id,
@@ -274,12 +294,28 @@ def score(results: list[Result]) -> dict[str, float]:
     return metrics
 
 
-def configuration(embedding_provider: EmbeddingProvider) -> dict[str, Any]:
+def configuration(
+    embedding_provider: EmbeddingProvider,
+    max_chunk_tokens: int | None = None,
+    chunk_provider: EmbeddingProvider | None = None,
+) -> dict[str, Any]:
     """Record the settings that produced a number, so runs stay comparable."""
+    counter = chunk_provider or embedding_provider
+
     return {
         "chunker": {
             "function": f"{chunk_pages.__module__}.{chunk_pages.__name__}",
-            "max_input_tokens": embedding_provider.max_input_tokens,
+            "tokenizer": type(counter).__name__,
+            "max_input_tokens": counter.max_input_tokens,
+            # The budget actually applied, resolved the same way the
+            # chunker resolves it. A report that recorded only the window
+            # and an unset override would describe a 32k-window model as
+            # having chunked at 32k, which is not what happened.
+            "chunk_tokens": min(
+                max_chunk_tokens or counter.chunk_tokens,
+                counter.max_input_tokens,
+            ),
+            "max_chunk_tokens": max_chunk_tokens,
             "special_token_margin": SPECIAL_TOKEN_MARGIN,
             "overlap_ratio": OVERLAP_RATIO,
         },
@@ -303,7 +339,8 @@ def render(
     lines.append("Retrieval evaluation")
     lines.append("=" * 62)
     lines.append(
-        f"chunker         {config['chunker']['max_input_tokens']} token window / "
+        f"chunker         {config['chunker']['chunk_tokens']} token chunks "
+        f"({config['chunker']['max_input_tokens']} token window) / "
         f"{config['chunker']['overlap_ratio']:.0%} overlap"
     )
     lines.append(
@@ -379,7 +416,15 @@ async def main_async(args: argparse.Namespace) -> int:
 
     started = time.monotonic()
 
-    embedding_provider: EmbeddingProvider = LocalEmbeddingProvider()
+    if args.provider not in EMBEDDING_PROVIDERS:
+        print(
+            f"Unknown provider {args.provider!r}. Expected one of: "
+            f"{', '.join(sorted(EMBEDDING_PROVIDERS))}.",
+            file=sys.stderr,
+        )
+        return 2
+
+    embedding_provider: EmbeddingProvider = EMBEDDING_PROVIDERS[args.provider]()
 
     vector_store: VectorStore = QdrantVectorStore(
         collection_name=args.collection,
@@ -391,11 +436,23 @@ async def main_async(args: argparse.Namespace) -> int:
     # one. Reproducibility is the entire point of a baseline number.
     organization_id = str(uuid.uuid4())
 
+    # Chunking and embedding are separable on purpose. Two models with
+    # different tokenizers produce different chunk boundaries at the same
+    # nominal budget, so comparing them head-on measures the chunker and
+    # the model at once. Pinning the chunker to one provider makes the
+    # difference between two runs the embedding and nothing else.
+    chunk_provider = embedding_provider
+
+    if args.chunk_with and args.chunk_with != args.provider:
+        chunk_provider = EMBEDDING_PROVIDERS[args.chunk_with]()
+
     chunk_counts = await index_corpus(
         args.corpus,
         organization_id,
         embedding_provider,
         vector_store,
+        args.max_chunk_tokens,
+        chunk_provider,
     )
 
     results = await run_questions(
@@ -406,7 +463,9 @@ async def main_async(args: argparse.Namespace) -> int:
     )
 
     metrics = score(results)
-    config = configuration(embedding_provider)
+    config = configuration(
+        embedding_provider, args.max_chunk_tokens, chunk_provider
+    )
     elapsed = time.monotonic() - started
 
     print(render(metrics, results, config, chunk_counts, elapsed))
@@ -469,6 +528,30 @@ def main() -> int:
     parser.add_argument("--questions", type=Path, default=DEFAULT_QUESTIONS)
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    parser.add_argument(
+        "--provider",
+        default="local",
+        help="embedding provider to score (local, nvidia)",
+    )
+    parser.add_argument(
+        "--chunk-with",
+        default=None,
+        help=(
+            "count tokens with this provider instead of the one being "
+            "scored, so two models can be compared on identical chunks"
+        ),
+    )
+    parser.add_argument(
+        "--max-chunk-tokens",
+        type=int,
+        default=None,
+        help=(
+            "cap chunk size below the model window. Needed to compare "
+            "models with different windows on equal terms - a 256-token "
+            "model and a 32k-token one otherwise get different chunks as "
+            "well as different embeddings, and the delta means nothing."
+        ),
+    )
     parser.add_argument("--report", type=Path, help="write a JSON report here")
     parser.add_argument(
         "--validate-only",
