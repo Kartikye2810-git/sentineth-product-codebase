@@ -155,8 +155,10 @@ jobs:
               '',
               `${r.corpus.documents} documents / ${r.corpus.chunks} chunks · ` +
                 `${r.questions.total} questions · ${c.embedding_provider} ` +
-                `(${c.dimension}d) · chunker ${c.chunker.chunk_size} chars / ` +
-                `${c.chunker.overlap} overlap`,
+                `(${c.dimension}d) · ${c.retrieval}` +
+                `${c.rerank ? ` + rerank top ${c.rerank.depth}` : ''} · ` +
+                `chunker ${c.chunker.chunk_tokens} tokens / ` +
+                `${(c.chunker.overlap_ratio * 100).toFixed(0)}% overlap`,
               '',
               '<sub>This job is advisory and never blocks a merge. Chunk count ' +
                 'is part of the result: recall@5 over more, smaller chunks is a ' +
