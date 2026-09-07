@@ -1,12 +1,12 @@
-from logging.config import fileConfig
-from pathlib import Path
 import os
 import sys
+from logging.config import fileConfig
+from pathlib import Path
 
+from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
 from alembic import context
-from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------
@@ -47,8 +47,8 @@ if config.config_file_name is not None:
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from app.db import models  # noqa: F401  (registers the ORM models on Base.metadata)
 from app.db.database import Base
-from app.db import models
 
 
 # Tell Alembic which metadata to compare against the database

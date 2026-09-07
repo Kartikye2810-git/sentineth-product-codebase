@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: sentineth
+          POSTGRES_PASSWORD: sentineth
+          POSTGRES_DB: sentineth_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sentineth"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Throwaway database for this run only. The app reads DATABASE_URL from
+      # the environment, so no .env file is needed (and none is committed).
+      DATABASE_URL: postgresql+psycopg://sentineth:sentineth@localhost:5432/sentineth_ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU wheel first: the default PyPI torch wheel pulls the CUDA stack,
+          # which is a multi-GB download this runner has no use for.
+          pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: pytest
+        run: python -m pytest
+
+      - name: alembic upgrade head
+        run: alembic upgrade head
+
+      - name: alembic check
+        # Fails if app/db/models.py has drifted from alembic/versions.
+        run: alembic check

@@ -7,6 +7,7 @@ class StorageProvider(ABC):
     async def save(
         self,
         organization_id: str,
+        document_id: str,
         filename: str,
         content: bytes,
     ) -> str:

@@ -7,6 +7,7 @@ Tests never touch Postgres, Qdrant, or a real LLM.
 
 import os
 
+
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["SQL_ECHO"] = "false"
 
@@ -26,7 +27,6 @@ from app.dependencies import (
 from app.main import app
 from app.providers.storage.local import LocalStorageProvider
 from app.security import require_organization_access
-
 from tests.fakes import (
     FakeEmbeddingProvider,
     FakeLLMProvider,
@@ -111,3 +111,15 @@ def organization(client):
         return response.json()["id"]
 
     return _create
+
+
+@pytest.fixture
+def api_key_client(client):
+    """`client` with real API-key authentication restored.
+
+    The `client` fixture overrides require_organization_access away, which is
+    what the pipeline tests want. The api-key endpoints can only be tested
+    with it in place.
+    """
+    del app.dependency_overrides[require_organization_access]
+    return client

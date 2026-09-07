@@ -97,32 +97,8 @@ Slack, GitHub, Teams, email, meeting ingestion, change detection, organizational
 
 ## Next Priorities
 
-### Phase 1 — Production Foundation
-
-| Priority | Why / dependencies / effort / approach |
-|---|---|
-| Users, memberships, roles/RBAC | Required for real tenant administration; depends on an identity-provider decision; 2–3 weeks; add User/Membership models and policy dependencies. |
-| Authorization tests | Prevent tenant regressions; depends on auth fixtures; 3–5 days; test missing/wrong/revoked keys and cross-org lifecycle actions. |
-| Audit logging | Required for enterprise trust; depends on actor model; 1 week; append immutable security/data events. |
-| Background jobs | Avoid request-bound ingestion; depends on queue choice; 2 weeks; durable jobs, progress, retries, DLQ. |
-| Object storage | Required for scale; depends on cloud choice; 1 week; provider adapter with signed access. |
-
-### Phase 2 — Strategic Moat
-
-| Priority | Why / dependencies / effort / approach |
-|---|---|
-| GitHub connector | Highest-value engineering context; OAuth/app model; 2–3 weeks; incremental sync of repos/issues/PRs. |
-| Slack connector | Captures decisions and blockers; OAuth/events; 2–3 weeks; normalize channels/messages/threads. |
-| Organizational memory and change sync | Turns RAG into intelligence; connector contracts; 4–8 weeks; shared people/project/decision/event schema. |
-| Knowledge graph | Enables relationship reasoning; memory schema; 3–6 weeks; start with explicit normalized links. |
-
-### Phase 3 — Product Experience
-
-| Priority | Why / dependencies / effort / approach |
-|---|---|
-| Frontend | Required for customers; auth/workspace APIs; 3–5 weeks; workspace, library, chat, citations. |
-| Search and citations | Trust and discovery; page metadata; 1–2 weeks; source viewer and filters. |
-| Agents/workflows | Long-term action layer; reliable memory/RBAC/audit; 4–8 weeks; narrow, observable workflows first. |
+See `docs/ROADMAP.md`. It is the single source of truth for sequencing, and
+replaces the three-phase priority tables that used to sit here.
 
 ## Enterprise Readiness Assessment
 
@@ -134,4 +110,7 @@ Read this document and `AGENTS.md` first. Inspect architecture and call sites be
 
 ## Recommended Next Task
 
-Implement comprehensive authorization and lifecycle integration tests: missing/wrong/revoked keys, cross-organization list/delete/reindex attempts, reindex success/failure compensation, and API-key rotation. This is the highest-impact next task because the new security boundary is not yet independently tested.
+Phase 1 of `docs/ROADMAP.md`: build the retrieval evaluation harness before
+changing any retrieval behaviour. The authorization tests this section used to
+recommend landed in Phase 0.4 (`tests/test_api_keys.py`); the remaining
+cross-organization lifecycle cases are Phase 3.2.

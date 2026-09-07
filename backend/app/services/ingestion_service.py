@@ -1,12 +1,22 @@
+import logging
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.db.models import Document, DocumentChunk
+from app.errors import (
+    DocumentProcessingError,
+    ExtractionFailed,
+    ProviderUnavailable,
+    UnsupportedMediaType,
+)
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.vector.base import VectorStore
 from app.services.chunking_service import chunk_text
 from app.services.extraction_service import extract_text_from_pdf
+
+
+logger = logging.getLogger(__name__)
 
 
 async def ingest_document(
@@ -15,25 +25,37 @@ async def ingest_document(
     embedding_provider: EmbeddingProvider,
     vector_store: VectorStore,
 ) -> list[DocumentChunk]:
+    """Chunk, embed and index a document.
+
+    Flushes but never commits or rolls back: the caller owns the
+    transaction boundary. A failure here has to be undone together with
+    the document row itself, and only the caller can see both.
+    """
     document.status = "PROCESSING"
     document.error_message = None
+    document.error_code = None
 
     try:
         if document.content_type != "application/pdf":
-            raise ValueError(
+            raise UnsupportedMediaType(
                 "Only PDF documents are supported right now."
             )
 
         # Extract text from the stored document.
-        text = extract_text_from_pdf(
-            document.storage_path
-        )
+        try:
+            text = extract_text_from_pdf(
+                document.storage_path
+            )
+        except Exception as exc:
+            raise ExtractionFailed(
+                "Could not read text from the document."
+            ) from exc
 
         # Split extracted text into chunks.
         chunks = chunk_text(text)
 
         if not chunks:
-            raise ValueError(
+            raise ExtractionFailed(
                 "Document produced no usable chunks."
             )
 
@@ -60,12 +82,17 @@ async def ingest_document(
             for chunk in document_chunks
         ]
 
-        embeddings = await embedding_provider.embed(
-            chunk_texts
-        )
+        try:
+            embeddings = await embedding_provider.embed(
+                chunk_texts
+            )
+        except Exception as exc:
+            raise ProviderUnavailable(
+                "Embedding provider is unavailable."
+            ) from exc
 
         if len(embeddings) != len(document_chunks):
-            raise ValueError(
+            raise DocumentProcessingError(
                 "Embedding count does not match chunk count."
             )
 
@@ -89,26 +116,40 @@ async def ingest_document(
             )
 
         # Store embeddings in Qdrant.
-        await vector_store.upsert(
-            organization_id=organization_id,
-            vectors=embeddings,
-            payloads=payloads,
-        )
+        try:
+            await vector_store.upsert(
+                organization_id=organization_id,
+                vectors=embeddings,
+                payloads=payloads,
+            )
+        except Exception as exc:
+            raise ProviderUnavailable(
+                "Vector store is unavailable."
+            ) from exc
 
         # Everything succeeded.
         document.status = "READY"
         document.error_message = None
-
-        db.commit()
+        document.error_code = None
 
         return document_chunks
 
+    except DocumentProcessingError:
+        logger.exception(
+            "Ingestion failed for document %s",
+            document.id,
+            extra={"document_id": str(document.id)},
+        )
+
+        raise
+
     except Exception as exc:
-        document.status = "FAILED"
-        document.error_message = "Document processing failed."
+        logger.exception(
+            "Ingestion failed for document %s",
+            document.id,
+            extra={"document_id": str(document.id)},
+        )
 
-        db.rollback()
-
-        raise ValueError(
+        raise DocumentProcessingError(
             "Document processing failed."
         ) from exc

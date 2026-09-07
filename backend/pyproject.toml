@@ -1,0 +1,58 @@
+# Tooling configuration for the Sentineth AI backend.
+#
+# There is no build system here on purpose: the backend is run as a source
+# tree (uvicorn app.main:app), not installed as a package. This file exists
+# only to configure ruff and mypy so CI and local runs agree.
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["."]
+exclude = ["alembic/versions", ".venv"]
+
+[tool.ruff.lint]
+# Deliberately a starter set, not everything ruff offers. E4/E7/E9 + F are
+# ruff's defaults (real errors, not style); I keeps imports ordered; B catches
+# mutable-default / loop-variable-capture style bugs; UP keeps us on modern
+# syntax now that the floor is Python 3.13.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests"]
+# The codebase already uses two blank lines after the import block everywhere;
+# pin it so adopting isort does not reflow every file.
+lines-after-imports = 2
+
+[tool.ruff.lint.flake8-bugbear]
+# Depends()/File()/Query() in a parameter default is the FastAPI calling
+# convention, not the mutable-default bug B008 is looking for.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+    "fastapi.Security",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Both files must call load_dotenv() before importing anything that reads
+# DATABASE_URL at import time, so the late imports are deliberate.
+"alembic/env.py" = ["E402"]
+"app/main.py" = ["E402"]
+# Throwaway import-smoke script; removed in Phase 0 item 0.8.
+
+[tool.mypy]
+python_version = "3.13"
+files = ["app"]
+exclude = ["^alembic/", "^\\.venv/"]
+ignore_missing_imports = true
+# Not yet enforced in CI. The codebase was written without annotations, so
+# turning strictness on wholesale would produce noise nobody will read. The
+# config lives here so `mypy` is runnable today and can be tightened - and
+# then added to the CI job - once modules are annotated.
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true

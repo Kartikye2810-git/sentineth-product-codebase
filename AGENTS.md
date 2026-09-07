@@ -900,83 +900,9 @@ These are future product layers.
 
 # 26. Product Roadmap
 
-The intended progression is:
-
-## Phase 1 — Harden MVP
-
-- better extraction
-- better chunking
-- metadata
-- duplicate detection
-- document lifecycle management
-- delete/re-index
-- better retrieval
-- better error handling
-- tests
-- logging
-- source citations
-- streaming
-
-## Phase 2 — Product UX
-
-- frontend
-- authentication
-- organizations/workspaces
-- document library
-- chat UI
-- search UI
-- source viewer
-- settings
-- polished loading/error/empty states
-
-## Phase 3 — Connectors
-
-- GitHub
-- Slack
-- Teams
-- email
-- meetings
-
-## Phase 4 — Organizational Memory
-
-Build a persistent knowledge layer connecting:
-
-```text
-people
-projects
-documents
-messages
-meetings
-repositories
-commits
-issues
-decisions
-tasks
-```
-
-## Phase 5 — Intelligence
-
-Sentineth should answer questions such as:
-
-```text
-Why was this decision made?
-
-Who owns this project?
-
-What changed this week?
-
-What are the current blockers?
-
-What did the team decide in the last meeting?
-
-Which GitHub changes relate to this decision?
-
-What do we know about Project X?
-
-What risks are emerging?
-
-What needs attention?
-```
+The roadmap lives in `docs/ROADMAP.md`, which is the single source of truth
+for what gets built next and in what order. It supersedes the phase list that
+used to sit in this section.
 
 ---
 

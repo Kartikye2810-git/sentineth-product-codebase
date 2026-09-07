@@ -23,13 +23,5 @@ class VectorStore(ABC):
         pass
 
     @abstractmethod
-    async def delete(
-        self,
-        organization_id: str,
-        ids: list[str],
-    ) -> None:
-        pass
-
-    @abstractmethod
     async def delete_document(self, organization_id: str, document_id: str) -> None:
         pass

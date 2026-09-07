@@ -23,29 +23,19 @@ class FakeEmbeddingProvider(EmbeddingProvider):
 
     Not semantic, but texts sharing words land closer together, which is
     enough to assert that retrieval ranks the relevant chunk first.
-
-    `max_input_tokens` mirrors all-MiniLM-L6-v2 so the suite runs against
-    the same limit production does, and inherits the base class's
-    character-based token estimate.
     """
 
     def __init__(
         self,
         dimension: int = 64,
-        max_input_tokens: int = 256,
     ) -> None:
         self._dimension = dimension
-        self._max_input_tokens = max_input_tokens
 
     @property
     def dimension(self) -> int:
         return self._dimension
 
-    @property
-    def max_input_tokens(self) -> int:
-        return self._max_input_tokens
-
-    async def _embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(text) for text in texts]
 
     def _vector(self, text: str) -> list[float]:
@@ -83,7 +73,7 @@ class FakeVectorStore(VectorStore):
 
         org_id = str(organization_id)
 
-        for index, (vector, payload) in enumerate(zip(vectors, payloads)):
+        for index, (vector, payload) in enumerate(zip(vectors, payloads, strict=True)):
             stored_payload = dict(payload)
             stored_payload["organization_id"] = org_id
 
@@ -115,7 +105,7 @@ class FakeVectorStore(VectorStore):
 
             score = sum(
                 a * b
-                for a, b in zip(query_vector, point["vector"])
+                for a, b in zip(query_vector, point["vector"], strict=True)
             )
             scored.append((score, point_id, point))
 
@@ -129,19 +119,6 @@ class FakeVectorStore(VectorStore):
             }
             for score, point_id, point in scored[:limit]
         ]
-
-    async def delete(
-        self,
-        organization_id: str,
-        ids: list[str],
-    ) -> None:
-        org_id = str(organization_id)
-
-        for point_id in list(ids):
-            point = self.points.get(point_id)
-
-            if point and point["payload"].get("organization_id") == org_id:
-                del self.points[point_id]
 
     async def delete_document(self, organization_id: str, document_id: str) -> None:
         for point_id, point in list(self.points.items()):

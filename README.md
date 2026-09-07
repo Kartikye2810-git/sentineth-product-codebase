@@ -7,8 +7,10 @@ citations back to the source file.
 Every document, vector and answer is scoped to an organization. One tenant
 cannot read another tenant's data.
 
-Status: pre-alpha. The RAG pipeline works end to end. There is no
-authentication yet, so do not expose this to the internet.
+Status: pre-alpha. The RAG pipeline works end to end. Every document
+route requires an organization API key, but anyone who can reach the service
+can create an organization and there is no rate limiting, so do not expose
+this to the internet yet.
 
 ## How it works
 
@@ -203,14 +205,30 @@ curl -X POST http://127.0.0.1:8000/organizations/ORG_ID/search -H "Content-Type:
 
 ## API reference
 
-| Method | Path                                     | Purpose                                |
-| ------ | ---------------------------------------- | -------------------------------------- |
-| GET    | `/`                                      | Service name and version               |
-| GET    | `/health`                                | Liveness check                         |
-| POST   | `/organizations`                         | Create an organization                 |
-| POST   | `/organizations/{org_id}/documents`      | Upload and index a PDF (multipart)     |
-| POST   | `/organizations/{org_id}/search`         | Vector search, returns matching chunks |
-| POST   | `/organizations/{org_id}/query`          | Retrieval-augmented answer + citations |
+| Method | Path                                             | Purpose                                 |
+| ------ | ------------------------------------------------ | --------------------------------------- |
+| GET    | `/`                                              | Service name and version                |
+| GET    | `/health`                                        | Liveness check                          |
+| POST   | `/organizations`                                 | Create an organization, returns its key |
+| GET    | `/organizations/{org_id}/api-keys`               | Key metadata, never the token itself    |
+| POST   | `/organizations/{org_id}/api-keys/rotate`        | Issue a replacement, revoke the old key |
+| DELETE | `/organizations/{org_id}/api-keys/{key_id}`      | Revoke one key                          |
+| GET    | `/organizations/{org_id}/documents`              | List documents, paginated               |
+| POST   | `/organizations/{org_id}/documents`              | Upload and index a PDF (multipart)      |
+| DELETE | `/organizations/{org_id}/documents/{doc_id}`     | Delete the row, the file and its vectors |
+| POST   | `/organizations/{org_id}/documents/{doc_id}/reindex` | Re-chunk and re-embed one document  |
+| POST   | `/organizations/{org_id}/search`                 | Vector search, returns matching chunks  |
+| POST   | `/organizations/{org_id}/query`                  | Retrieval-augmented answer + citations  |
+
+Every route under `/organizations/{org_id}` requires
+`Authorization: Bearer <key>` for that organization; a key belonging to
+another organization is rejected with 403. `POST /organizations` is the one
+exception, and returns the first key in `api_key` — the only time a token is
+ever readable. Only its SHA-256 hash is stored.
+
+Failed requests answer with `{"detail": {"error_code": ..., "message": ...}}`:
+415 for a non-PDF upload, 422 when text cannot be extracted, 503 when the
+embedding provider or vector store is unreachable.
 
 `search` and `query` both accept `{"query": str, "limit": int}`, where `limit`
 is 1 to 20 and defaults to 5. `query` caps the question at 2000 characters.
@@ -223,13 +241,13 @@ From `backend/`:
 python -m pytest
 ```
 
-13 tests, about half a second, no Docker and no network required. They run
+38 tests, well under a second, no Docker and no network required. They run
 against SQLite in memory with in-memory embedding, vector and LLM providers,
 but real PDF parsing, real chunking and real on-disk storage.
 
 The suite covers the whole upload-to-answer path, organization isolation, chunk
-overlap, and the source-citation regression that made `sources[].filename`
-always null.
+overlap, the source-citation regression that made `sources[].filename` always
+null, the API-key lifecycle, and the structured log line every request emits.
 
 The fakes in `tests/fakes.py` subclass the real provider interfaces, so if a
 provider signature changes without its implementations following, the tests
@@ -258,14 +276,13 @@ sentineth/
   AGENTS.md                  architecture, conventions, and rules for changes
   docker-compose.yml         Postgres + Qdrant
   .env.example               template for .env
-  frontend/                  empty, not started
   backend/
     alembic/                 migrations
     app/
       main.py                app, health, organizations
       dependencies.py        cached provider factories
       schemas.py             request/response models
-      api/documents.py       upload, search, query
+      api/documents.py       upload, list, delete, reindex, search, query
       services/              document, chunking, retrieval, query
       providers/             embeddings, llm, vector, storage adapters
       db/                    engine, session, models
@@ -327,13 +344,15 @@ real API differences. Bump both together.
 
 ## Not built yet
 
-- Authentication and authorization. `organization_id` is taken from the URL and
-  trusted, so any caller can read any organization's data. This is the top
-  blocker before any deployment.
-- Frontend. The directory is empty.
-- File types other than PDF. Other uploads are rejected, though currently with
-  a 500 instead of a 415.
+What gets built next, and in what order, is in `docs/ROADMAP.md`.
+
+- User accounts, roles and permissions. A key authenticates an organization,
+  not a person, so there is no way to say who did what or to give one user
+  less access than another.
+- Anything in front of `POST /organizations`. Organization creation is
+  unauthenticated and unthrottled, which is the top blocker before any
+  deployment.
+- Frontend. There is none.
+- File types other than PDF. Other uploads are rejected with a 415.
 - Background processing. Upload is synchronous, so a large PDF holds the request
   open until indexing finishes.
-- Document listing and deletion endpoints. The vector store supports delete;
-  nothing calls it.

@@ -1,6 +1,6 @@
-from app.services.chunking_service import chunk_text
-
 import pytest
+
+from app.services.chunking_service import chunk_text
 
 
 def test_empty_text_produces_no_chunks():

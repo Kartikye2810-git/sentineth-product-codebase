@@ -8,6 +8,7 @@ __pycache__/
 
 # IDE
 .vscode/
+.serena/
 
 # OS
 .DS_Store

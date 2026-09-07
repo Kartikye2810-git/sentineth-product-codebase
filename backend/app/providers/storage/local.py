@@ -27,18 +27,25 @@ class LocalStorageProvider(StorageProvider):
     async def save(
         self,
         organization_id: str,
+        document_id: str,
         filename: str,
         content: bytes,
     ) -> str:
-        org_dir = self.base_dir / str(organization_id)
-        org_dir.mkdir(parents=True, exist_ok=True)
+        org_root = (self.base_dir / str(organization_id)).resolve(strict=False)
 
-        safe_filename = self._sanitize_filename(filename)
-        target_path = (org_dir / safe_filename).resolve(strict=False)
-        org_root = org_dir.resolve(strict=False)
+        # One directory per document id. Without it two uploads sharing a
+        # filename resolve to the same path and the second silently
+        # overwrites the first.
+        target_path = (
+            org_root
+            / self._sanitize_filename(str(document_id))
+            / self._sanitize_filename(filename)
+        ).resolve(strict=False)
 
-        if target_path != org_root and org_root not in target_path.parents:
+        if org_root not in target_path.parents:
             raise ValueError("Filename resolves outside the organization storage directory.")
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(target_path, "wb") as handle:
             handle.write(content)

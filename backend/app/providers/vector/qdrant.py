@@ -119,7 +119,7 @@ class QdrantVectorStore(VectorStore):
         points: list[qmodels.PointStruct] = []
 
         for index, (vector, payload) in enumerate(
-            zip(vectors, payloads)
+            zip(vectors, payloads, strict=True)
         ):
             if len(vector) != self.vector_size:
                 raise ValueError(
@@ -145,11 +145,8 @@ class QdrantVectorStore(VectorStore):
                     "match the supplied organization_id."
                 )
 
-            # Use Qdrant's typed object rather than a dictionary. The HTTP
-            # backend currently accepts dictionaries, but the in-process
-            # backend used by verification requires PointStruct instances.
-            # Keeping both paths on the documented client type prevents a
-            # local check from masking a production incompatibility.
+            # Qdrant's typed object rather than a dictionary: the HTTP
+            # backend accepts both, the in-process one only PointStruct.
             points.append(
                 qmodels.PointStruct(
                     id=self._build_point_id(
@@ -224,43 +221,6 @@ class QdrantVectorStore(VectorStore):
             for item in results
         ]
 
-    async def delete(
-        self,
-        organization_id: str,
-        ids: list[str],
-    ) -> None:
-        org_id = str(organization_id)
-
-        if not ids:
-            return
-
-        # Both conditions are required. Selecting by id alone would let a
-        # caller delete another organization's points by guessing an id,
-        # so the organization filter is a boundary check, not an
-        # optimization. Qdrant expresses "these ids, and also matching
-        # this filter" as a single filter containing HasIdCondition.
-        filter_clause = qmodels.Filter(
-            must=[
-                qmodels.FieldCondition(
-                    key="organization_id",
-                    match=qmodels.MatchValue(
-                        value=org_id,
-                    ),
-                ),
-                qmodels.HasIdCondition(
-                    has_id=[str(point_id) for point_id in ids],
-                ),
-            ]
-        )
-
-        self._client.delete(
-            collection_name=self.collection_name,
-            points_selector=qmodels.FilterSelector(
-                filter=filter_clause,
-            ),
-            wait=True,
-        )
-
     async def delete_document(self, organization_id: str, document_id: str) -> None:
         self._client.delete(
             collection_name=self.collection_name,
@@ -270,19 +230,3 @@ class QdrantVectorStore(VectorStore):
             ])),
             wait=True,
         )
-
-    def recreate_collection(self) -> None:
-        """Drop the collection and create it again, empty.
-
-        Discards every vector for every organization. Used by the
-        re-index script, where the alternative - deleting points one
-        document at a time - leaves behind any point whose database row
-        has since disappeared.
-
-        Not on the `VectorStore` interface: it is a maintenance operation
-        on this specific backend, not something request handling needs.
-        """
-        if self._client.collection_exists(self.collection_name):
-            self._client.delete_collection(self.collection_name)
-
-        self._ensure_collection()
