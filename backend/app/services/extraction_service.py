@@ -2,6 +2,9 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
+from app.errors import InputTooLarge
+from app.settings import get_settings
+
 
 def extract_pages(file_path: str) -> list[str]:
     """Text of every page, in order, empty pages included as empty strings.
@@ -17,7 +20,17 @@ def extract_pages(file_path: str) -> list[str]:
 
     reader = PdfReader(str(path))
 
-    return [(page.extract_text() or "").strip() for page in reader.pages]
+    limits = get_settings()
+    if len(reader.pages) > limits.max_pages:
+        raise InputTooLarge("Document exceeds the page limit.")
+    pages, size = [], 0
+    for page in reader.pages:
+        text = (page.extract_text() or "").strip()
+        size += len(text)
+        if size > limits.max_extracted_chars:
+            raise InputTooLarge("Extracted document text exceeds the limit.")
+        pages.append(text)
+    return pages
 
 
 def extract_text_from_pdf(file_path: str) -> str:

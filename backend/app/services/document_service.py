@@ -1,168 +1,132 @@
-import hashlib
-import logging
+"""HTTP-side queue admission. No embeddings or vector calls run during upload."""
+import asyncio
+from datetime import timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import UploadFile
-from sqlalchemy import delete
+from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.db.models import Document, DocumentChunk
-from app.errors import DocumentProcessingError, ExtractionFailed
-from app.providers.embeddings.base import EmbeddingProvider
+from app.clock import utcnow
+from app.db.models import Document, IngestionJob, Organization, OrganizationRateLimit
+from app.errors import DocumentBusy, QuotaExceeded, UnsupportedMediaType
 from app.providers.storage.base import StorageProvider
-from app.providers.vector.base import VectorStore
-from app.services.ingestion_service import ingest_document
+from app.settings import get_settings
 
 
-logger = logging.getLogger(__name__)
+PENDING = ("QUEUED", "PROCESSING", "DELETING")
 
 
-async def delete_document(db: Session, organization_id: UUID, document_id: UUID, storage_provider: StorageProvider, vector_store: VectorStore) -> None:
-    document = db.get(Document, document_id)
-    if document is None or document.organization_id != organization_id:
-        raise LookupError("Document not found.")
-    await vector_store.delete_document(str(organization_id), str(document_id))
-    await storage_provider.delete(document.storage_path)
-    db.delete(document)
-    db.commit()
+def lock_organization(db: Session, organization_id: UUID):
+    # Serialize admission across API processes; counts and increments are atomic.
+    org = db.scalar(select(Organization).where(Organization.id == organization_id).with_for_update())
+    if org is None:
+        raise LookupError("Organization not found.")
 
 
-async def reindex_document(db: Session, organization_id: UUID, document_id: UUID, embedding_provider: EmbeddingProvider, vector_store: VectorStore) -> Document:
-    document = db.get(Document, document_id)
-    if document is None or document.organization_id != organization_id:
-        raise LookupError("Document not found.")
-    await vector_store.delete_document(str(organization_id), str(document_id))
-    db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document_id))
-    db.flush()
+def consume_rate(db: Session, organization_id: UUID, operation: str, limit: int):
+    now = utcnow()
+    row = db.get(OrganizationRateLimit, (organization_id, operation))
+    if row is None:
+        row = OrganizationRateLimit(organization_id=organization_id, operation=operation,
+                                    window_start=now, requests=0)
+        db.add(row)
+    if now >= row.window_start + timedelta(minutes=1):
+        row.window_start, row.requests = now, 0
+    if row.requests >= limit:
+        raise QuotaExceeded("Organization request rate limit reached. Retry in a minute.")
+    row.requests += 1
+
+
+def check_job_capacity(db: Session, organization_id: UUID):
+    count = db.scalar(select(func.count(Document.id)).where(
+        Document.organization_id == organization_id, Document.status.in_(PENDING))) or 0
+    if count >= get_settings().max_pending_jobs_per_org:
+        raise QuotaExceeded("Organization has too many pending document jobs.")
+
+
+def queue_document(db: Session, organization_id: UUID, file: UploadFile,
+                   storage_provider: StorageProvider) -> Document:
+    if file.content_type != "application/pdf":
+        raise UnsupportedMediaType("Only PDF documents are supported right now.")
+    settings = get_settings()
+    path = ""
     try:
-        await ingest_document(db, document, embedding_provider, vector_store)
-        db.commit()
-    except Exception:
+        lock_organization(db, organization_id)
+        consume_rate(db, organization_id, "upload", settings.uploads_per_minute)
+        check_job_capacity(db, organization_id)
+        count, size = db.execute(select(func.count(Document.id), func.coalesce(func.sum(Document.file_size), 0))
+            .where(Document.organization_id == organization_id)).one()
+        if count >= settings.max_documents_per_org or size >= settings.max_storage_bytes_per_org:
+            raise QuotaExceeded("Organization document storage quota reached.")
+        document_id = uuid4()
+        path, byte_count, digest = storage_provider.save_stream(
+            str(organization_id), str(document_id), file.filename or "document.pdf", file.file,
+            min(settings.max_upload_bytes, settings.max_storage_bytes_per_org - size))
+        document = Document(id=document_id, organization_id=organization_id,
+            filename=Path((file.filename or "document.pdf").replace("\\", "/")).name[:255],
+            content_type="application/pdf", file_size=byte_count, storage_path=path,
+            content_hash=digest, status="QUEUED", index_generation=1)
+        db.add(document)
+        db.flush()
+        db.add(IngestionJob(document_id=document.id, organization_id=organization_id))
+        db.commit()  # The document and its job become durable together.
+        db.refresh(document)
+        return document
+    except BaseException:
         db.rollback()
+        if path:
+            asyncio.run(storage_provider.delete(path))
         raise
-    db.refresh(document)
+
+
+def get_document(db: Session, organization_id: UUID, document_id: UUID, *, lock=False) -> Document:
+    statement = select(Document).where(Document.id == document_id,
+                                      Document.organization_id == organization_id)
+    if lock:
+        statement = statement.with_for_update(nowait=True)
+    try:
+        document = db.scalar(statement)
+    except OperationalError as exc:
+        db.rollback()
+        if getattr(exc.orig, "sqlstate", None) == "55P03":
+            raise DocumentBusy("Document is being processed. Retry shortly.") from exc
+        raise
+    if document is None:
+        raise LookupError("Document not found.")
     return document
 
 
-async def _discard_stored_file(storage_provider: StorageProvider, path: str) -> None:
-    """Best effort: a cleanup failure must not mask the original one."""
-    if not path:
-        return
-
+def queue_existing(db: Session, organization_id: UUID, document_id: UUID, operation: str) -> Document:
     try:
-        await storage_provider.delete(path)
-    except Exception:
-        logger.exception("Could not delete the stored file at %s", path)
-
-
-def _compute_sha256(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-async def save_document(
-    db: Session,
-    organization_id: UUID,
-    file: UploadFile,
-    storage_provider: StorageProvider,
-    embedding_provider: EmbeddingProvider,
-    vector_store: VectorStore,
-) -> Document:
-
-    file_content = await file.read()
-
-    if not file_content:
-        raise ExtractionFailed("Uploaded document is empty.")
-
-    content_hash = _compute_sha256(file_content)
-
-    filename = Path(
-        file.filename or "unnamed_file"
-    ).name
-
-    document = Document(
-        organization_id=organization_id,
-        filename=filename,
-        content_type=(
-            file.content_type
-            or "application/octet-stream"
-        ),
-        file_size=len(file_content),
-        # Placeholder. The real path needs document.id, which only exists
-        # after the flush below, and is set before anything commits.
-        storage_path="",
-        content_hash=content_hash,
-        status="UPLOADED",
-        error_message=None,
-        error_code=None,
-    )
-
-    # Flush before writing any bytes, so the row and its id exist first. The
-    # id is what makes the storage path unique, and a row without a file is
-    # recoverable in a way a file without a row is not.
-    db.add(document)
-    db.flush()
-
-    stored_path = ""
-
-    try:
-        stored_path = await storage_provider.save(
-            organization_id=str(organization_id),
-            document_id=str(document.id),
-            filename=filename,
-            content=file_content,
-        )
-        document.storage_path = stored_path
-        db.flush()
-    except Exception as exc:
-        logger.exception(
-            "Storing the uploaded file failed for document %s",
-            document.id,
-            extra={"document_id": str(document.id)},
-        )
-
-        db.rollback()
-
-        raise DocumentProcessingError(
-            "Failed to store the uploaded document."
-        ) from exc
-
-    try:
-        await ingest_document(
-            db=db,
-            document=document,
-            embedding_provider=embedding_provider,
-            vector_store=vector_store,
-        )
-
+        lock_organization(db, organization_id)
+        document = get_document(db, organization_id, document_id, lock=True)
+        job = db.scalar(select(IngestionJob).where(IngestionJob.document_id == document_id))
+        # A claimed worker may be between transactions. Do not cancel its lease.
+        if job and job.status == "PROCESSING":
+            raise DocumentBusy("Document is being processed. Retry shortly.")
+        if operation == "INGEST":
+            if document.status in PENDING:
+                raise DocumentBusy("Document already has pending work.")
+            if not document.storage_path:
+                raise DocumentBusy("Source file is unavailable; upload the document again.")
+            consume_rate(db, organization_id, "upload", get_settings().uploads_per_minute)
+            check_job_capacity(db, organization_id)
+            document.index_generation += 1
+        elif document.status not in PENDING:
+            check_job_capacity(db, organization_id)
+        if job is None:
+            job = IngestionJob(document_id=document.id, organization_id=organization_id)
+            db.add(job)
+        job.operation, job.status, job.attempts = operation, "QUEUED", 0
+        job.available_at, job.lease_until, job.error_code = utcnow(), None, None
+        document.status = "DELETING" if operation == "DELETE" else "QUEUED"
+        document.error_code = document.error_message = None
         db.commit()
         db.refresh(document)
-
-    except DocumentProcessingError as exc:
-        logger.exception(
-            "Document processing failed for document %s",
-            document.id,
-            extra={"document_id": str(document.id), "error_code": exc.code},
-        )
-
+        return document
+    except BaseException:
         db.rollback()
-
-        # Nothing readable will ever point at these bytes again: the row
-        # is about to say FAILED and no read path serves a FAILED
-        # document. Left alone they would accumulate forever.
-        await _discard_stored_file(storage_provider, stored_path)
-
-        document.status = "FAILED"
-        document.storage_path = ""
-        document.error_message = str(exc)
-        document.error_code = exc.code
-
-        try:
-            db.add(document)
-            db.commit()
-        except Exception:
-            db.rollback()
-
         raise
-
-    return document

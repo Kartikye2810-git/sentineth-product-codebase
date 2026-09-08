@@ -17,6 +17,8 @@ class OpenRouterProvider(LLMProvider):
 
         self._client = AsyncOpenAI(
             api_key=api_key,
+            timeout=10.0,
+            max_retries=2,
             base_url=os.getenv(
                 "OPENROUTER_BASE_URL",
                 "https://openrouter.ai/api/v1",

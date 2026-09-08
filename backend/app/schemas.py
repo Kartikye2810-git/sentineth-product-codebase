@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class OrganizationCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=255)
 
 
 class OrganizationResponse(BaseModel):
@@ -83,7 +83,7 @@ class DocumentListResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1)
+    query: str = Field(..., min_length=1, max_length=2000)
     limit: int = Field(default=5, ge=1, le=20)
 
 

@@ -16,11 +16,10 @@ from scripts and background jobs, not just from request handlers.
 
 import logging
 import os
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 
-from fastapi import HTTPException
-
+from app.errors import ProviderUnavailable
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.embeddings.local import LocalEmbeddingProvider
 from app.providers.embeddings.nvidia import NvidiaEmbeddingProvider
@@ -48,15 +47,60 @@ EMBEDDING_PROVIDERS = {
     "nvidia": NvidiaEmbeddingProvider,
 }
 
+# nemotron-3-embed-1b is the primary model. It beat all-MiniLM-L6-v2 by
+# 12.7 points of recall@5 on the 102-question eval set (82.4% -> 95.1%,
+# p=0.004), which is not a margin a default should be on the wrong side of.
+# "local" remains for offline development and CI, where no key exists.
+DEFAULT_EMBEDDING_PROVIDER = "nvidia"
+
+# One collection per embedding model. A collection's vector size is fixed
+# when it is created, so 2048-dimension vectors have nowhere to go in a
+# 384-dimension collection; keeping them apart is also what makes a model
+# rollback free rather than a second migration.
+COLLECTIONS = {
+    "local": "sentineth_documents",
+    "nvidia": "sentineth_documents_nemotron",
+}
+
+
+def active_embedding_provider() -> str:
+    return os.getenv("EMBEDDING_PROVIDER", DEFAULT_EMBEDDING_PROVIDER).strip().lower()
+
+
+def active_collection_name() -> str:
+    """The collection this configuration reads and writes.
+
+    Derived from the provider rather than defaulted alongside it, so the two
+    cannot disagree about which vectors belong to which model. This was
+    computed inline in two places and one of them did not case-fold, so
+    EMBEDDING_PROVIDER=NVIDIA pointed the application and the reindex script
+    at different collections.
+    """
+    return os.getenv("QDRANT_COLLECTION") or COLLECTIONS.get(
+        active_embedding_provider(), COLLECTIONS["local"]
+    )
+
+
+def configured_provider(factory):
+    @wraps(factory)
+    def build():
+        try:
+            return factory()
+        except Exception as exc:
+            logger.exception("Provider initialization failed")
+            raise ProviderUnavailable("Provider is unavailable or not configured.") from exc
+    return build
+
 
 @lru_cache(maxsize=1)
+@configured_provider
 def get_embedding_provider() -> EmbeddingProvider:
     # Selected by environment because switching embedding models means
     # rebuilding every vector, and the safe way to do that is to build the
     # new collection alongside the old one and change which one the process
     # reads. That makes the cutover - and the rollback - a restart with a
     # different value here, not a deploy. See scripts/reindex.py.
-    name = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+    name = active_embedding_provider()
 
     if name not in EMBEDDING_PROVIDERS:
         raise ValueError(
@@ -76,20 +120,14 @@ def get_embedding_provider() -> EmbeddingProvider:
 
 
 @lru_cache(maxsize=1)
+@configured_provider
 def get_vector_store() -> VectorStore:
     # Derive the collection dimension from the active embedding provider
     # instead of hardcoding it, so the two can never drift apart.
     dimension = get_embedding_provider().dimension
 
-    # One collection per embedding model, because a collection's vector
-    # size is fixed at creation and 384-dimension vectors cannot live
-    # beside 2048-dimension ones. Keeping them separate is also what makes
-    # the rollback free: the old collection is still there, still correct.
     store = QdrantVectorStore(
-        collection_name=os.getenv(
-            "QDRANT_COLLECTION",
-            "sentineth_documents",
-        ),
+        collection_name=active_collection_name(),
         vector_size=dimension,
         # Like the dimension, this is fixed when the collection is created
         # and cannot be added later, so changing it is a reindex into a new
@@ -108,6 +146,7 @@ def get_vector_store() -> VectorStore:
 
 
 @lru_cache(maxsize=1)
+@configured_provider
 def get_rerank_provider() -> RerankProvider | None:
     # Off unless asked for. It loads a second model into the process and
     # adds a forward pass per candidate to every search, so it should be
@@ -132,18 +171,9 @@ def _build_llm_provider() -> LLMProvider:
     return OpenRouterProvider()
 
 
+@configured_provider
 def get_llm_provider() -> LLMProvider:
-    # lru_cache does not cache exceptions, so a misconfigured provider
-    # keeps raising instead of poisoning the cache with a failure.
-    try:
-        return _build_llm_provider()
-    except ValueError as exc:
-        logger.error("LLM provider is not configured: %s", exc)
-
-        raise HTTPException(
-            status_code=500,
-            detail="LLM provider is not configured.",
-        ) from exc
+    return _build_llm_provider()
 
 
 def reset_provider_cache() -> None:

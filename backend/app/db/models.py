@@ -82,6 +82,8 @@ class Document(Base):
         nullable=False,
     )
 
+    index_generation: Mapped[int] = mapped_column(default=0, nullable=False)
+
     content_hash: Mapped[str | None] = mapped_column(
         String(64),
         nullable=True,
@@ -191,3 +193,31 @@ class OrganizationApiKey(Base):
         return self.revoked_at is None and (
             self.expires_at is None or self.expires_at > utcnow()
         )
+
+
+class IngestionJob(Base):
+    """One durable work item per document; retries reuse the same generation."""
+    __tablename__ = "ingestion_jobs"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    document_id: Mapped[UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("organizations.id"), index=True, nullable=False
+    )
+    operation: Mapped[str] = mapped_column(String(20), nullable=False, default="INGEST")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="QUEUED")
+    attempts: Mapped[int] = mapped_column(default=0, nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+
+class OrganizationRateLimit(Base):
+    __tablename__ = "organization_rate_limits"
+
+    organization_id: Mapped[UUID] = mapped_column(ForeignKey("organizations.id"), primary_key=True)
+    operation: Mapped[str] = mapped_column(String(20), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    requests: Mapped[int] = mapped_column(nullable=False, default=0)

@@ -5,6 +5,7 @@ because `app.db.database` reads it and builds an engine at import time.
 Tests never touch Postgres, Qdrant, or a real LLM.
 """
 
+import asyncio
 import os
 
 
@@ -27,6 +28,8 @@ from app.dependencies import (
 from app.main import app
 from app.providers.storage.local import LocalStorageProvider
 from app.security import require_organization_access
+from app.settings import get_settings
+from app.worker import run_once
 from tests.fakes import (
     FakeEmbeddingProvider,
     FakeLLMProvider,
@@ -99,6 +102,9 @@ def client(
     app.dependency_overrides[require_organization_access] = lambda: None
 
     with TestClient(app) as test_client:
+        def process_one():
+            return asyncio.run(run_once(db_session_factory, embedding_provider, vector_store, storage_provider))
+        test_client.process_one = process_one
         yield test_client
 
     app.dependency_overrides.clear()
@@ -126,3 +132,10 @@ def api_key_client(client):
     """
     del app.dependency_overrides[require_organization_access]
     return client
+
+
+@pytest.fixture(autouse=True)
+def clean_settings():
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()

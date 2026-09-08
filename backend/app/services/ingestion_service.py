@@ -1,5 +1,6 @@
 import logging
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy.orm import Session
 
@@ -7,7 +8,9 @@ from app.db.models import Document, DocumentChunk
 from app.errors import (
     DocumentProcessingError,
     ExtractionFailed,
+    InputTooLarge,
     ProviderUnavailable,
+    SourceMissing,
     UnsupportedMediaType,
 )
 from app.providers.embeddings.base import EmbeddingProvider
@@ -15,6 +18,7 @@ from app.providers.vector.base import VectorStore
 from app.services.chunking_service import chunk_pages
 from app.services.extraction_service import extract_pages
 from app.services.lexical_service import encode_passage
+from app.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,13 @@ async def ingest_document(
             pages = extract_pages(
                 document.storage_path
             )
+        except InputTooLarge:
+            raise
+        except FileNotFoundError as exc:
+            raise SourceMissing(
+                "The stored file for this document is missing. "
+                "Upload it again."
+            ) from exc
         except Exception as exc:
             raise ExtractionFailed(
                 "Could not read text from the document."
@@ -70,11 +81,15 @@ async def ingest_document(
                 "Document produced no usable chunks."
             )
 
+        if len(chunks) > get_settings().max_chunks:
+            raise InputTooLarge("Document produces too many chunks.")
+
         # Create database chunk records.
         document_chunks: list[DocumentChunk] = []
 
         for index, piece in enumerate(chunks):
             chunk = DocumentChunk(
+                id=uuid5(NAMESPACE_URL, f"{document.id}:{document.index_generation}:{index}"),
                 document_id=document.id,
                 chunk_index=index,
                 content=piece.content,

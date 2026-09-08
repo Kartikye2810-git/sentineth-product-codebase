@@ -48,6 +48,7 @@ async def answer_query(
     llm_provider: LLMProvider,
     limit: int = 5,
     rerank_provider: RerankProvider | None = None,
+    document_ids: list[str] | None = None,
 ) -> dict:
     if not query or not query.strip():
         raise ValueError("Query cannot be empty.")
@@ -64,6 +65,7 @@ async def answer_query(
         vector_store=vector_store,
         limit=limit,
         rerank_provider=rerank_provider,
+        document_ids=document_ids,
     )
 
     if not results:

@@ -28,6 +28,7 @@ class VectorStore(ABC):
         query_vector: list[float],
         limit: int = 5,
         sparse_query: tuple[list[int], list[float]] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Nearest chunks for one organization.
 
