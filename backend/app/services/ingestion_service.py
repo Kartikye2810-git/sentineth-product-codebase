@@ -12,8 +12,9 @@ from app.errors import (
 )
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.vector.base import VectorStore
-from app.services.chunking_service import chunk_text
-from app.services.extraction_service import extract_text_from_pdf
+from app.services.chunking_service import chunk_pages
+from app.services.extraction_service import extract_pages
+from app.services.lexical_service import encode_passage
 
 
 logger = logging.getLogger(__name__)
@@ -41,9 +42,10 @@ async def ingest_document(
                 "Only PDF documents are supported right now."
             )
 
-        # Extract text from the stored document.
+        # Extract text from the stored document, one entry per page, so a
+        # chunk can say which page it came from.
         try:
-            text = extract_text_from_pdf(
+            pages = extract_pages(
                 document.storage_path
             )
         except Exception as exc:
@@ -51,8 +53,17 @@ async def ingest_document(
                 "Could not read text from the document."
             ) from exc
 
-        # Split extracted text into chunks.
-        chunks = chunk_text(text)
+        if not any(page.strip() for page in pages):
+            raise ExtractionFailed(
+                "No extractable text found in the document. "
+                "It may be scanned or image-based."
+            )
+
+        # Split extracted text into chunks the embedding provider can
+        # read in full. The provider is passed in rather than consulted
+        # later so the chunk size and the model that embeds it can never
+        # be configured independently of each other.
+        chunks = chunk_pages(pages, embedding_provider)
 
         if not chunks:
             raise ExtractionFailed(
@@ -62,11 +73,12 @@ async def ingest_document(
         # Create database chunk records.
         document_chunks: list[DocumentChunk] = []
 
-        for index, content in enumerate(chunks):
+        for index, piece in enumerate(chunks):
             chunk = DocumentChunk(
                 document_id=document.id,
                 chunk_index=index,
-                content=content,
+                content=piece.content,
+                page_number=piece.page_number,
             )
 
             db.add(chunk)
@@ -84,7 +96,8 @@ async def ingest_document(
 
         try:
             embeddings = await embedding_provider.embed(
-                chunk_texts
+                chunk_texts,
+                input_type="passage",
             )
         except Exception as exc:
             raise ProviderUnavailable(
@@ -110,10 +123,22 @@ async def ingest_document(
                     "document_id": str(document.id),
                     "chunk_id": str(chunk.id),
                     "chunk_index": chunk.chunk_index,
+                    "page_number": chunk.page_number,
                     "content": chunk.content,
                     "filename": document.filename,
                 }
             )
+
+        # Lexical vectors only when the collection has somewhere to put
+        # them. Sending them to a dense-only collection is an error, not a
+        # no-op, because it means the two sides disagree about what this
+        # index is.
+        sparse_vectors = None
+
+        if vector_store.hybrid:
+            sparse_vectors = [
+                encode_passage(chunk.content) for chunk in document_chunks
+            ]
 
         # Store embeddings in Qdrant.
         try:
@@ -121,6 +146,7 @@ async def ingest_document(
                 organization_id=organization_id,
                 vectors=embeddings,
                 payloads=payloads,
+                sparse_vectors=sparse_vectors,
             )
         except Exception as exc:
             raise ProviderUnavailable(

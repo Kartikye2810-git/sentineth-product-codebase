@@ -53,8 +53,11 @@ def db_session_factory():
 
 
 @pytest.fixture
-def embedding_provider():
-    return FakeEmbeddingProvider()
+def embedding_provider(request):
+    # 256 to match MiniLM's window. Tests that need a document split across
+    # several chunks parametrize this indirectly with a smaller one rather
+    # than padding the fixture PDFs out to hundreds of words.
+    return FakeEmbeddingProvider(max_input_tokens=getattr(request, "param", 256))
 
 
 @pytest.fixture

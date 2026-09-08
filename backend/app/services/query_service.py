@@ -2,6 +2,7 @@ from uuid import UUID
 
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.llm.base import LLMProvider
+from app.providers.rerank.base import RerankProvider
 from app.providers.vector.base import VectorStore
 from app.services.retrieval_service import retrieve
 
@@ -17,11 +18,22 @@ def _build_context(chunks: list[dict]) -> str:
         document_id = payload.get("document_id") or chunk.get("document_id") or "unknown"
         chunk_id = payload.get("chunk_id") or chunk.get("chunk_id") or "unknown"
         chunk_index = payload.get("chunk_index") or chunk.get("chunk_index") or index
+        filename = payload.get("filename") or chunk.get("filename")
+        page_number = payload.get("page_number") or chunk.get("page_number")
+
+        # Named the way the answer should cite it. The model repeats what
+        # it is shown, so showing it "page 14" is what gets "page 14" into
+        # the answer instead of a chunk id no reader can act on.
+        located = f"{filename or document_id}"
+        if page_number is not None:
+            located += f", page {page_number}"
+
         context_parts.append(
             f"SOURCE {index}\n"
             f"Document: {document_id}\n"
             f"Chunk: {chunk_id}\n"
-            f"Chunk Index: {chunk_index}\n\n"
+            f"Chunk Index: {chunk_index}\n"
+            f"Cite as: {located}\n\n"
             f"{content.strip()}"
         )
 
@@ -35,6 +47,7 @@ async def answer_query(
     vector_store: VectorStore,
     llm_provider: LLMProvider,
     limit: int = 5,
+    rerank_provider: RerankProvider | None = None,
 ) -> dict:
     if not query or not query.strip():
         raise ValueError("Query cannot be empty.")
@@ -50,6 +63,7 @@ async def answer_query(
         embedding_provider=embedding_provider,
         vector_store=vector_store,
         limit=limit,
+        rerank_provider=rerank_provider,
     )
 
     if not results:
@@ -83,6 +97,7 @@ async def answer_query(
         source = {
             "document_id": result.get("document_id"),
             "chunk_id": result.get("chunk_id"),
+            "page_number": result.get("page_number"),
             "filename": result.get("filename"),
             "chunk_index": result.get("chunk_index"),
             "score": result.get("score"),

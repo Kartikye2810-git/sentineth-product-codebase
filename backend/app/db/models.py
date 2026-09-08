@@ -149,6 +149,13 @@ class DocumentChunk(Base):
         nullable=False,
     )
 
+    # Nullable because chunks written before this column existed have no
+    # page to point at, and because a source without pages (a pasted note,
+    # a connector payload) is a shape this table will have to hold later.
+    page_number: Mapped[int | None] = mapped_column(
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=utcnow,

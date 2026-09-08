@@ -1,47 +1,73 @@
 """Minimal valid PDF generation for tests.
 
 Building a real PDF (rather than monkeypatching text extraction) means
-the tests exercise `extraction_service.extract_text_from_pdf` and pypdf
-for real, which is where format bugs actually live.
+the tests exercise `extraction_service.extract_pages` and pypdf for real,
+which is where format bugs actually live.
 """
 
 
-def build_pdf(lines: list[str]) -> bytes:
-    """Return a single-page PDF containing `lines` as extractable text."""
+def _escape(line: str) -> bytes:
+    escaped = (
+        line.replace("\\", r"\\")
+        .replace("(", r"\(")
+        .replace(")", r"\)")
+    )
 
-    operators = [b"BT", b"/F1 12 Tf", b"72 720 Td", b"14 TL"]
+    return escaped.encode("latin-1")
 
-    for line in lines:
-        escaped = (
-            line.replace("\\", r"\\")
-            .replace("(", r"\(")
-            .replace(")", r"\)")
-        )
-        operators.append(f"({escaped}) Tj".encode("latin-1"))
-        operators.append(b"T*")
 
-    operators.append(b"ET")
+def build_pdf_pages(pages: list[list[str]]) -> bytes:
+    """Return a PDF of `len(pages)` pages, each holding its own lines.
 
-    content = b"\n".join(operators)
+    Multi-page matters for anything asserting on page numbers: a
+    single-page document cannot tell a correct page number from a
+    hardcoded 1.
+    """
+    page_count = len(pages)
 
-    objects = [
+    first_page_obj = 3
+    first_content_obj = first_page_obj + page_count
+    font_obj = first_content_obj + page_count
+
+    kids = " ".join(f"{first_page_obj + i} 0 R" for i in range(page_count))
+
+    objects: list[bytes] = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        (
-            b"<< /Type /Page /Parent 2 0 R "
-            b"/MediaBox [0 0 612 792] "
-            b"/Resources << /Font << /F1 5 0 R >> >> "
-            b"/Contents 4 0 R >>"
-        ),
-        (
+        f"<< /Type /Pages /Kids [{kids}] /Count {page_count} >>".encode("ascii"),
+    ]
+
+    for index in range(page_count):
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R "
+                f"/MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 {font_obj} 0 R >> >> "
+                f"/Contents {first_content_obj + index} 0 R >>"
+            ).encode("ascii")
+        )
+
+    for lines in pages:
+        operators = [b"BT", b"/F1 12 Tf", b"72 720 Td", b"14 TL"]
+
+        for line in lines:
+            # A blank line is drawn as a single space: pypdf emits nothing
+            # for an empty show operator, which would collapse the
+            # paragraph breaks the chunker splits on.
+            operators.append(b"(" + _escape(line or " ") + b") Tj")
+            operators.append(b"T*")
+
+        operators.append(b"ET")
+        content = b"\n".join(operators)
+
+        objects.append(
             b"<< /Length "
             + str(len(content)).encode("ascii")
             + b" >>\nstream\n"
             + content
             + b"\nendstream"
-        ),
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-    ]
+        )
+
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 
     out = bytearray(b"%PDF-1.4\n")
     offsets: list[int] = []
@@ -67,3 +93,8 @@ def build_pdf(lines: list[str]) -> bytes:
     out += b"%%EOF\n"
 
     return bytes(out)
+
+
+def build_pdf(lines: list[str]) -> bytes:
+    """Return a single-page PDF containing `lines` as extractable text."""
+    return build_pdf_pages([lines])

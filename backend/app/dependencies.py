@@ -15,6 +15,7 @@ from scripts and background jobs, not just from request handlers.
 """
 
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -22,8 +23,11 @@ from fastapi import HTTPException
 
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.embeddings.local import LocalEmbeddingProvider
+from app.providers.embeddings.nvidia import NvidiaEmbeddingProvider
 from app.providers.llm.base import LLMProvider
 from app.providers.llm.openrouter import OpenRouterProvider
+from app.providers.rerank.base import RerankProvider
+from app.providers.rerank.local import LocalRerankProvider
 from app.providers.storage.base import StorageProvider
 from app.providers.storage.local import LocalStorageProvider
 from app.providers.vector.base import VectorStore
@@ -39,9 +43,28 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 STORAGE_DIR = BACKEND_DIR / "storage" / "documents"
 
 
+EMBEDDING_PROVIDERS = {
+    "local": LocalEmbeddingProvider,
+    "nvidia": NvidiaEmbeddingProvider,
+}
+
+
 @lru_cache(maxsize=1)
 def get_embedding_provider() -> EmbeddingProvider:
-    provider = LocalEmbeddingProvider()
+    # Selected by environment because switching embedding models means
+    # rebuilding every vector, and the safe way to do that is to build the
+    # new collection alongside the old one and change which one the process
+    # reads. That makes the cutover - and the rollback - a restart with a
+    # different value here, not a deploy. See scripts/reindex.py.
+    name = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+
+    if name not in EMBEDDING_PROVIDERS:
+        raise ValueError(
+            f"Unknown EMBEDDING_PROVIDER {name!r}. "
+            f"Expected one of: {', '.join(sorted(EMBEDDING_PROVIDERS))}."
+        )
+
+    provider = EMBEDDING_PROVIDERS[name]()
 
     logger.info(
         "Embedding provider ready: %s (dimension=%s)",
@@ -58,17 +81,45 @@ def get_vector_store() -> VectorStore:
     # instead of hardcoding it, so the two can never drift apart.
     dimension = get_embedding_provider().dimension
 
+    # One collection per embedding model, because a collection's vector
+    # size is fixed at creation and 384-dimension vectors cannot live
+    # beside 2048-dimension ones. Keeping them separate is also what makes
+    # the rollback free: the old collection is still there, still correct.
     store = QdrantVectorStore(
+        collection_name=os.getenv(
+            "QDRANT_COLLECTION",
+            "sentineth_documents",
+        ),
         vector_size=dimension,
+        # Like the dimension, this is fixed when the collection is created
+        # and cannot be added later, so changing it is a reindex into a new
+        # collection rather than a setting that takes effect on restart.
+        hybrid=os.getenv("QDRANT_HYBRID", "").strip().lower() in {"1", "true", "yes"},
     )
 
     logger.info(
-        "Vector store ready: collection=%s dimension=%s",
+        "Vector store ready: collection=%s dimension=%s hybrid=%s",
         store.collection_name,
         dimension,
+        store.hybrid,
     )
 
     return store
+
+
+@lru_cache(maxsize=1)
+def get_rerank_provider() -> RerankProvider | None:
+    # Off unless asked for. It loads a second model into the process and
+    # adds a forward pass per candidate to every search, so it should be
+    # switched on by someone who has seen it pay for that.
+    if os.getenv("RERANK", "").strip().lower() not in {"1", "true", "yes"}:
+        return None
+
+    provider = LocalRerankProvider()
+
+    logger.info("Rerank provider ready: %s", type(provider).__name__)
+
+    return provider
 
 
 @lru_cache(maxsize=1)
@@ -103,5 +154,6 @@ def reset_provider_cache() -> None:
     """
     get_embedding_provider.cache_clear()
     get_vector_store.cache_clear()
+    get_rerank_provider.cache_clear()
     get_storage_provider.cache_clear()
     _build_llm_provider.cache_clear()
