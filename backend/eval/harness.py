@@ -10,6 +10,12 @@ change to any of them shows up here without the harness being edited. It
 deliberately stops before the LLM: the answer step cannot be scored without
 a judge, and a judge would put a model between the change and the number.
 
+Four kinds of question, because three of the ways a retrieval stack fails a
+customer are invisible to the fourth: `span` and `identifier` ask for a
+passage that exists, `unanswerable` asks for one that does not, and
+`conflict` asks for two passages that disagree with each other. See
+KINDS below and eval/README.md.
+
 Ground truth is a document plus a verbatim `answer_span`, never a chunk id.
 Chunk ids change the moment chunking changes, which is item 1.2 and item 1.3
 of this very phase; a span survives re-chunking and a model swap, so the same
@@ -28,6 +34,7 @@ import statistics
 import sys
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,7 +52,10 @@ if str(BACKEND_DIR) not in sys.path:
 # has not sourced anything. Same file the application reads.
 load_dotenv(BACKEND_DIR.parent / ".env")
 
-from app.dependencies import EMBEDDING_PROVIDERS  # noqa: E402
+from app.dependencies import (  # noqa: E402
+    EMBEDDING_PROVIDERS,
+    active_embedding_provider,
+)
 from app.providers.embeddings.base import EmbeddingProvider  # noqa: E402
 from app.providers.rerank.base import RerankProvider  # noqa: E402
 from app.providers.rerank.local import LocalRerankProvider  # noqa: E402
@@ -85,6 +95,21 @@ def normalise(text: str) -> str:
     return _WHITESPACE.sub(" ", text).strip().casefold()
 
 
+# What a question asks of retrieval. `span` and `identifier` are scored by
+# the same document-plus-span rule and differ only in what they are there to
+# detect: an identifier lookup ("what is ACT-3") is the subgroup a lexical
+# index is supposed to rescue, and a subgroup that is mixed into the headline
+# cannot show that it was rescued. `unanswerable` and `conflict` are scored
+# by their own rules, below.
+KINDS = ("span", "identifier", "unanswerable", "conflict")
+
+# The kinds recall@k and MRR are computed over. An unanswerable question has
+# no correct document to rank, and a conflict question is answered only when
+# two documents come back rather than one, so folding either of them into the
+# headline would quietly change what the headline means.
+RECALL_KINDS = ("span", "identifier")
+
+
 @dataclass
 class Question:
     id: str
@@ -92,6 +117,11 @@ class Question:
     question: str
     answer_span: str
     review: str = "draft"
+    kind: str = "span"
+    # The other side of a conflict: the second document that speaks to the
+    # same fact, and the span in it that disagrees with `answer_span`.
+    conflict_doc: str = ""
+    conflict_span: str = ""
 
 
 @dataclass
@@ -99,10 +129,25 @@ class Result:
     question: Question
     rank: int | None
     retrieved: list[str] = field(default_factory=list)
+    second_rank: int | None = None
+    # Score of the top hit, whatever document it came from. This is the only
+    # thing an unanswerable question can be measured by: retrieval returns
+    # ten chunks whether or not the corpus knows anything, so the question is
+    # whether the score it returns them with is separable from the score an
+    # answerable question gets.
+    top_score: float | None = None
 
     @property
     def found(self) -> bool:
         return self.rank is not None
+
+    @property
+    def both_sides(self) -> int | None:
+        """Rank by which both sides of a conflict are in hand."""
+        if self.rank is None or self.second_rank is None:
+            return None
+
+        return max(self.rank, self.second_rank)
 
 
 def load_questions(path: Path) -> list[Question]:
@@ -117,6 +162,14 @@ def load_questions(path: Path) -> list[Question]:
         except json.JSONDecodeError as exc:
             raise ValueError(f"{path}:{number} is not valid JSON: {exc}") from exc
 
+        kind = record.get("kind", "span")
+
+        if kind not in KINDS:
+            raise ValueError(
+                f"{path}:{number} has unknown kind {kind!r}. "
+                f"Expected one of: {', '.join(KINDS)}."
+            )
+
         questions.append(
             Question(
                 id=record["id"],
@@ -124,6 +177,9 @@ def load_questions(path: Path) -> list[Question]:
                 question=record["question"],
                 answer_span=record["answer_span"],
                 review=record.get("review", "draft"),
+                kind=kind,
+                conflict_doc=record.get("conflict_doc", ""),
+                conflict_span=record.get("conflict_span", ""),
             )
         )
 
@@ -146,11 +202,35 @@ def read_corpus(corpus: Path) -> dict[str, str]:
     return {pdf.stem: normalise(extract_text_from_pdf(str(pdf))) for pdf in pdfs}
 
 
-def validate(questions: list[Question], texts: dict[str, str]) -> tuple[list[str], list[str]]:
-    """Check every question against the corpus it will be scored on.
+# Each of these makes a question unscoreable, and every one of them is a
+# property of the question set rather than of retrieval. Printed with the
+# offending ids when `validate` finds any.
+PROBLEMS = {
+    "missing": (
+        "These answer spans do not appear in their document, so they can "
+        "never be retrieved. Fix the span or the corpus before trusting "
+        "any number below"
+    ),
+    "ambiguous": (
+        "These answer spans appear in more than one document. Scoring only "
+        "credits the attributed document, so these would be counted wrong "
+        "while answering correctly"
+    ),
+    "answerable": (
+        "These questions are marked unanswerable, but their span is in the "
+        "corpus, so the corpus does answer them. Abstaining on them is the "
+        "wrong behaviour and scoring them as false positives would reward it"
+    ),
+    "one_sided": (
+        "These conflict questions name one document twice or leave the "
+        "second side empty. A conflict is two documents that disagree; with "
+        "one document there is nothing to notice"
+    ),
+}
 
-    Two things can make a question unscoreable, and both are properties of the
-    question set rather than of retrieval:
+
+def validate(questions: list[Question], texts: dict[str, str]) -> dict[str, list[str]]:
+    """Check every question against the corpus it will be scored on.
 
     `missing` - the span is not in the document it is attributed to, so it can
     never be retrieved and depresses every metric for no reason.
@@ -159,29 +239,58 @@ def validate(questions: list[Question], texts: dict[str, str]) -> tuple[list[str
     a hit only when the retrieved chunk is from `question.doc`, so a distractor
     carrying the same sentence would be marked wrong while actually answering
     the question. That is a defect in the ground truth, not in the retriever.
+
+    `answerable` - the inverse rule, for unanswerable questions. Worth
+    enforcing because an unanswerable question is a claim about the whole
+    corpus and the corpus grows: without this, adding a document that happens
+    to answer one silently turns a test of false confidence into a question
+    the retriever is marked wrong for getting right.
+
+    `one_sided` - a conflict question with only one side. Both sides are
+    validated by the two rules above, each against its own document.
     """
-    missing: list[str] = []
-    ambiguous: list[str] = []
+    problems: dict[str, list[str]] = {key: [] for key in PROBLEMS}
 
     for question in questions:
-        if question.doc not in texts:
-            raise FileNotFoundError(
-                f"{question.doc}.pdf is missing from the corpus (question "
-                f"{question.id}). Run `python eval/build_corpus.py` first."
-            )
+        if question.kind == "unanswerable":
+            span = normalise(question.answer_span)
+            found = [doc for doc, text in texts.items() if span in text]
 
-        span = normalise(question.answer_span)
+            if found:
+                problems["answerable"].append(f"{question.id} (in {', '.join(found)})")
 
-        if span not in texts[question.doc]:
-            missing.append(question.id)
             continue
 
-        elsewhere = [doc for doc, text in texts.items() if doc != question.doc and span in text]
+        sides = [(question.doc, question.answer_span)]
 
-        if elsewhere:
-            ambiguous.append(f"{question.id} (also in {', '.join(elsewhere)})")
+        if question.kind == "conflict":
+            if not question.conflict_doc or question.conflict_doc == question.doc:
+                problems["one_sided"].append(question.id)
+                continue
 
-    return missing, ambiguous
+            sides.append((question.conflict_doc, question.conflict_span))
+
+        for doc, answer_span in sides:
+            if doc not in texts:
+                raise FileNotFoundError(
+                    f"{doc}.pdf is missing from the corpus (question "
+                    f"{question.id}). Run `python eval/build_corpus.py` first."
+                )
+
+            span = normalise(answer_span)
+
+            if span not in texts[doc]:
+                problems["missing"].append(question.id)
+                continue
+
+            elsewhere = [
+                other for other, text in texts.items() if other != doc and span in text
+            ]
+
+            if elsewhere:
+                problems["ambiguous"].append(f"{question.id} (also in {', '.join(elsewhere)})")
+
+    return problems
 
 
 async def index_corpus(
@@ -267,39 +376,101 @@ async def run_questions(
         )
 
         span = normalise(question.answer_span)
+        conflict_span = normalise(question.conflict_span)
         rank: int | None = None
+        second_rank: int | None = None
         retrieved: list[str] = []
 
         for position, hit in enumerate(hits, start=1):
             doc = str(hit.get("document_id", ""))
             retrieved.append(doc)
+            content = normalise(str(hit.get("content", "")))
 
             # A hit is the right document AND the passage that answers it.
             # Document-level matching would score a policy question correct
             # for retrieving any chunk of a sixty-page policy.
-            if rank is None and doc == question.doc:
-                if span in normalise(str(hit.get("content", ""))):
-                    rank = position
+            if rank is None and doc == question.doc and span in content:
+                rank = position
 
-        results.append(Result(question=question, rank=rank, retrieved=retrieved))
+            # The contradicting passage, tracked separately so that
+            # retrieving one side of a disagreement is never mistaken for
+            # having answered it.
+            if (
+                question.kind == "conflict"
+                and second_rank is None
+                and doc == question.conflict_doc
+                and conflict_span in content
+            ):
+                second_rank = position
+
+        results.append(
+            Result(
+                question=question,
+                rank=rank,
+                retrieved=retrieved,
+                second_rank=second_rank,
+                top_score=hits[0].get("score") if hits else None,
+            )
+        )
 
     return results
 
 
 def score(results: list[Result]) -> dict[str, float]:
-    total = len(results)
+    scored = [r for r in results if r.question.kind in RECALL_KINDS]
+    total = len(scored)
 
     if total == 0:
         return {}
 
     metrics = {
-        f"recall@{k}": sum(1 for r in results if r.rank is not None and r.rank <= k) / total
+        f"recall@{k}": sum(1 for r in scored if r.rank is not None and r.rank <= k) / total
         for k in REPORTED_K
     }
     metrics["mrr"] = statistics.fmean(
-        (1.0 / r.rank if r.rank is not None else 0.0) for r in results
+        (1.0 / r.rank if r.rank is not None else 0.0) for r in scored
     )
-    metrics["not_retrieved"] = sum(1 for r in results if not r.found) / total
+    metrics["not_retrieved"] = sum(1 for r in scored if not r.found) / total
+
+    conflicts = [r for r in results if r.question.kind == "conflict"]
+
+    if conflicts:
+        # Both sides or nothing. One side alone is not partial credit, it is
+        # the failure this family of questions exists to find: a superseded
+        # figure retrieved on its own reads as a confident answer, with
+        # nothing in the context window to contradict it.
+        for k in REPORTED_K:
+            metrics[f"conflict_both@{k}"] = sum(
+                1 for r in conflicts if r.both_sides is not None and r.both_sides <= k
+            ) / len(conflicts)
+
+        metrics["conflict_one_sided"] = sum(
+            1 for r in conflicts if (r.rank is None) != (r.second_rank is None)
+        ) / len(conflicts)
+
+    unanswered = [
+        r
+        for r in results
+        if r.question.kind == "unanswerable" and r.top_score is not None
+    ]
+    answerable_scores = sorted(r.top_score for r in scored if r.top_score is not None)
+
+    if unanswered and answerable_scores:
+        # Not a recall number: there is nothing to recall. What can be
+        # measured is whether the score retrieval comes back with is
+        # separable from the score it returns for a question the corpus can
+        # answer, because that separation is the whole basis on which a
+        # future abstention threshold could work. Medians, and the overlap
+        # between the two distributions.
+        cut = statistics.median(answerable_scores)
+
+        metrics["top_score_answerable"] = cut
+        metrics["top_score_unanswerable"] = statistics.median(
+            r.top_score for r in unanswered
+        )
+        metrics["unanswerable_above_median"] = sum(
+            1 for r in unanswered if r.top_score >= cut
+        ) / len(unanswered)
 
     return metrics
 
@@ -356,6 +527,8 @@ def render(
     lines: list[str] = []
     total = len(results)
     drafts = sum(1 for r in results if r.question.review == "draft")
+    kinds = Counter(r.question.kind for r in results)
+    scored = [r for r in results if r.question.kind in RECALL_KINDS]
 
     lines.append("Retrieval evaluation")
     lines.append("=" * 62)
@@ -382,21 +555,75 @@ def render(
         f"{sum(chunk_counts.values())} chunks"
     )
     lines.append(f"questions       {total} ({drafts} still marked draft)")
+    lines.append(
+        "                " + ", ".join(f"{kinds[kind]} {kind}" for kind in KINDS if kinds[kind])
+    )
     lines.append("")
+
+    # Recall is over the answerable questions only. The other kinds have
+    # their own sections; averaging them into this one would move the
+    # headline for reasons that have nothing to do with ranking.
+    graded = len(scored)
 
     for k in REPORTED_K:
         key = f"recall@{k}"
-        hits = round(metrics[key] * total)
-        lines.append(f"  {key:<12} {metrics[key]:>7.1%}   ({hits}/{total})")
+        hits = round(metrics[key] * graded)
+        lines.append(f"  {key:<12} {metrics[key]:>7.1%}   ({hits}/{graded})")
 
     lines.append(f"  {'MRR':<12} {metrics['mrr']:>7.3f}")
     lines.append(
         f"  {'missed':<12} {metrics['not_retrieved']:>7.1%}   "
-        f"({round(metrics['not_retrieved'] * total)}/{total} not in top {SEARCH_DEPTH})"
+        f"({round(metrics['not_retrieved'] * graded)}/{graded} not in top {SEARCH_DEPTH})"
     )
     lines.append("")
 
-    missed = [r for r in results if not r.found]
+    subgroups = {
+        kind: [r for r in scored if r.question.kind == kind] for kind in RECALL_KINDS
+    }
+
+    if all(subgroups.values()):
+        # An identifier lookup and a paraphrased policy question fail for
+        # different reasons, and a change that fixes one can cost the other.
+        # Reported apart so the average cannot hide that.
+        lines.append("recall@5 by kind:")
+
+        for kind, subset in subgroups.items():
+            hits = sum(1 for r in subset if r.rank is not None and r.rank <= 5)
+            lines.append(
+                f"  {kind:<12} {hits / len(subset):>7.1%}   ({hits}/{len(subset)})"
+            )
+
+        lines.append("")
+
+    conflicts = [r for r in results if r.question.kind == "conflict"]
+
+    if conflicts:
+        both = round(metrics["conflict_both@5"] * len(conflicts))
+
+        lines.append(f"conflicting evidence ({len(conflicts)} questions):")
+        lines.append(
+            f"  {'both@5':<12} {metrics['conflict_both@5']:>7.1%}   "
+            f"({both}/{len(conflicts)} with both sides of the disagreement in the top 5)"
+        )
+        lines.append(
+            f"  {'one-sided':<12} {metrics['conflict_one_sided']:>7.1%}   "
+            "(one side retrieved and the other not, at any rank)"
+        )
+        lines.append("")
+
+    if "top_score_unanswerable" in metrics:
+        lines.append(f"unanswerable ({kinds['unanswerable']} questions):")
+        lines.append(
+            f"  {'top score':<12} {metrics['top_score_unanswerable']:>7.3f}   "
+            f"median, against {metrics['top_score_answerable']:.3f} for answerable questions"
+        )
+        lines.append(
+            f"  {'overlap':<12} {metrics['unanswerable_above_median']:>7.1%}   "
+            "score at or above the answerable median, where no threshold separates them"
+        )
+        lines.append("")
+
+    missed = [r for r in scored if not r.found]
 
     if missed:
         lines.append(f"Not retrieved at any rank ({len(missed)}):")
@@ -416,31 +643,24 @@ async def main_async(args: argparse.Namespace) -> int:
     questions = load_questions(args.questions)
 
     texts = read_corpus(args.corpus)
-    missing, ambiguous = validate(questions, texts)
+    problems = validate(questions, texts)
 
-    if missing:
-        print(
-            "These answer spans do not appear in their document, so they can "
-            "never be retrieved. Fix the span or the corpus before trusting "
-            f"any number below:\n  {', '.join(missing)}",
-            file=sys.stderr,
-        )
+    for key, ids in problems.items():
+        if ids:
+            print(f"{PROBLEMS[key]}:\n  {', '.join(ids)}", file=sys.stderr)
 
-    if ambiguous:
-        print(
-            "These answer spans appear in more than one document. Scoring only "
-            "credits the attributed document, so these would be counted wrong "
-            f"while answering correctly:\n  {', '.join(ambiguous)}",
-            file=sys.stderr,
-        )
-
-    if missing or ambiguous:
+    if any(problems.values()):
         return 2
+
+    kinds = Counter(q.kind for q in questions)
 
     if args.validate_only:
         print(
             f"{len(questions)} questions against {len(texts)} documents: every "
-            "answer span is present in its own document and in no other."
+            "answer span is present in its own document and in no other, every "
+            "unanswerable span is in none of them, and every conflict names two "
+            "documents that disagree.\n  "
+            + ", ".join(f"{kinds[kind]} {kind}" for kind in KINDS if kinds[kind])
         )
         return 0
 
@@ -522,15 +742,41 @@ async def main_async(args: argparse.Namespace) -> int:
             "questions": {
                 "total": len(questions),
                 "draft": sum(1 for q in questions if q.review == "draft"),
+                "kinds": {kind: kinds[kind] for kind in KINDS if kinds[kind]},
             },
+            # Only the recall-scored kinds, because this is what compare.py
+            # pairs two runs on and the other kinds are not hit-or-miss at a
+            # rank. They are reported below instead.
             "results": [
                 {
                     "id": r.question.id,
                     "doc": r.question.doc,
+                    "kind": r.question.kind,
                     "rank": r.rank,
                     "retrieved": r.retrieved,
                 }
                 for r in results
+                if r.question.kind in RECALL_KINDS
+            ],
+            "conflict": [
+                {
+                    "id": r.question.id,
+                    "doc": r.question.doc,
+                    "rank": r.rank,
+                    "conflict_doc": r.question.conflict_doc,
+                    "second_rank": r.second_rank,
+                }
+                for r in results
+                if r.question.kind == "conflict"
+            ],
+            "unanswerable": [
+                {
+                    "id": r.question.id,
+                    "top_score": r.top_score,
+                    "retrieved": r.retrieved[:3],
+                }
+                for r in results
+                if r.question.kind == "unanswerable"
             ],
             "elapsed_seconds": round(elapsed, 2),
         }
@@ -570,8 +816,12 @@ def main() -> int:
     parser.add_argument("--collection", default=DEFAULT_COLLECTION)
     parser.add_argument(
         "--provider",
-        default="local",
-        help="embedding provider to score (local, nvidia)",
+        default=active_embedding_provider(),
+        help=(
+            "embedding provider to score (local, nvidia). Defaults to the "
+            "one the application would run, so an unqualified run scores "
+            "what production serves rather than a second configuration"
+        ),
     )
     parser.add_argument(
         "--chunk-with",
