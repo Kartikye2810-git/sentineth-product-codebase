@@ -22,6 +22,8 @@ class OpenAIProvider(LLMProvider):
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.base_url = base_url
         self.organization = organization
+        kwargs.setdefault("timeout", 10.0)
+        kwargs.setdefault("max_retries", 2)
         self._client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,

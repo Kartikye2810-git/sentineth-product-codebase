@@ -39,15 +39,12 @@ HANDBOOK_PDF = build_pdf_pages(
 
 
 def upload(client, organization_id, filename, content):
-    return client.post(
-        f"/organizations/{organization_id}/documents",
-        files=(
-            (
-                "file",
-                (filename, content, "application/pdf"),
-            ),
-        ),
-    )
+    queued = client.post(f"/organizations/{organization_id}/documents",
+                         files={"file": (filename, content, "application/pdf")})
+    assert queued.status_code == 202, queued.text
+    assert queued.json()["status"] == "QUEUED"
+    assert client.process_one()
+    return client.get(queued.headers["Location"])
 
 
 def test_health_and_root():
@@ -266,7 +263,8 @@ def test_same_filename_twice_does_not_overwrite(
     # Deleting one leaves the other's bytes on disk.
     assert client.delete(
         f"/organizations/{org_id}/documents/{first_id}"
-    ).status_code == 204
+    ).status_code == 202
+    client.process_one()
 
     assert not first_file.exists()
     assert second_file.read_bytes() == HIRING_PDF
@@ -298,7 +296,7 @@ def test_document_responses_do_not_leak_internal_fields(client, organization):
         client, org_id, "q3-planning.pdf", REVENUE_PDF
     ).json()
 
-    assert set(upload_body) == PUBLIC_DOCUMENT_FIELDS | {"message"}
+    assert set(upload_body) == PUBLIC_DOCUMENT_FIELDS
 
     listing = client.get(f"/organizations/{org_id}/documents")
 
@@ -349,14 +347,15 @@ def test_a_failed_document_reports_a_categorised_error_code(
 
     client.post(
         f"/organizations/{org_id}/documents",
-        files=(("file", ("notes.txt", b"plain text notes", "text/plain")),),
+        files=(("file", ("broken.pdf", b"not a PDF", "application/pdf")),),
     )
+    client.process_one()
 
     items = client.get(f"/organizations/{org_id}/documents").json()["items"]
 
     assert len(items) == 1
     assert items[0]["status"] == "FAILED"
-    assert items[0]["error_code"] == "UNSUPPORTED_MEDIA_TYPE"
+    assert items[0]["error_code"] == "EXTRACTION_FAILED"
 
 
 def test_a_failed_upload_leaves_no_file_behind(client, organization, tmp_path):
@@ -389,9 +388,10 @@ def test_a_successful_upload_commits_once(client, organization, monkeypatch):
 
     monkeypatch.setattr(Session, "commit", counting_commit)
 
-    response = upload(client, org_id, "revenue.pdf", REVENUE_PDF)
+    response = client.post(f"/organizations/{org_id}/documents",
+        files={"file": ("revenue.pdf", REVENUE_PDF, "application/pdf")})
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     # One layer owns the transaction boundary: the request writes the
     # document, its chunks and its READY status or none of them.
     assert len(commits) == 1
@@ -409,7 +409,9 @@ def test_reindexing_rebuilds_the_vectors_and_returns_the_document(
     response = client.post(
         f"/organizations/{org_id}/documents/{document_id}/reindex"
     )
-
+    assert response.status_code == 202
+    client.process_one()
+    response = client.get(response.headers["Location"])
     assert response.status_code == 200, response.text
 
     body = response.json()

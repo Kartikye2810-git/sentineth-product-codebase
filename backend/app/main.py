@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -91,6 +92,25 @@ async def log_request(request: Request, call_next):
     finally:
         request_id_var.reset(token)
 
+
+from app.body_limit import BodyLimitMiddleware
+from app.errors import DocumentProcessingError
+from app.settings import get_settings
+
+
+get_settings()
+app.add_middleware(BodyLimitMiddleware)
+
+@app.exception_handler(DocumentProcessingError)
+async def processing_error(request, exc):
+    logger.warning("Request rejected", extra={"error_code": exc.code})
+    return JSONResponse(status_code=exc.status_code,
+        content={"detail": {"error_code": exc.code, "message": str(exc)}},
+        headers={"Retry-After": "60"} if exc.status_code == 429 else None)
+
+@app.exception_handler(LookupError)
+async def missing_document(request, exc):
+    return JSONResponse(status_code=404, content={"detail": "Document not found."})
 
 app.include_router(documents_router)
 

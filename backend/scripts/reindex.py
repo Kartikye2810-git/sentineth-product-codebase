@@ -35,7 +35,6 @@ Usage:
 
 import argparse
 import asyncio
-import os
 import sys
 import time
 from pathlib import Path
@@ -47,7 +46,11 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 from app.db.database import SessionLocal  # noqa: E402
 from app.db.models import Document, DocumentChunk  # noqa: E402
-from app.dependencies import EMBEDDING_PROVIDERS  # noqa: E402
+from app.dependencies import (  # noqa: E402
+    EMBEDDING_PROVIDERS,
+    active_collection_name,
+    active_embedding_provider,
+)
 from app.providers.embeddings.base import EmbeddingProvider  # noqa: E402
 from app.providers.vector.qdrant import QdrantVectorStore  # noqa: E402
 from app.services.lexical_service import encode_passage  # noqa: E402
@@ -174,6 +177,13 @@ async def main_async(args: argparse.Namespace) -> int:
             f"Expected one of: {', '.join(sorted(EMBEDDING_PROVIDERS))}."
         )
 
+    # Resolved by the application's own helper, not recomputed here. When
+    # this was a second inline expression it disagreed with the application
+    # on a case-folded EMBEDDING_PROVIDER, and the guard below is only worth
+    # anything if "the active collection" means the same thing in both.
+    active = active_collection_name()
+    if args.collection == active and not args.verify_only:
+        raise SystemExit("Refusing to write to the active collection. Choose a separate target.")
     provider = EMBEDDING_PROVIDERS[args.provider]()
 
     store = QdrantVectorStore(
@@ -216,7 +226,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--provider",
-        default=os.getenv("EMBEDDING_PROVIDER", "local"),
+        default=active_embedding_provider(),
         help="embedding provider to build the new index with",
     )
     parser.add_argument(

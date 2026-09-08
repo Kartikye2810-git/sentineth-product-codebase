@@ -1,8 +1,10 @@
 # Roadmap
 
 The single source of truth for what Sentineth builds next, and in what order.
-`AGENTS.md` section 26 and `docs/PROJECT_STATUS_SEPT_2026.md` used to carry
+`info.md` section 26 and `docs/PROJECT_STATUS_SEPT_2026.md` used to carry
 roadmaps of their own; both now point here.
+
+Phases 0, 1 and 2 are delivered. Phase 3 is next.
 
 Phases are sequential. Each one exists because the next phase depends on it,
 and the "Done when" line is the test for moving on — not a feeling of
@@ -20,7 +22,7 @@ completeness.
 
 ---
 
-## Phase 0 — Restore a trustworthy baseline
+## Phase 0 — Restore a trustworthy baseline — **delivered** (`19d4751`)
 
 Bug fixes on the existing baseline. No feature work.
 
@@ -53,7 +55,7 @@ own criterion.
 
 ---
 
-## Phase 1 — Make retrieval correct, and make correctness measurable
+## Phase 1 — Make retrieval correct, and make correctness measurable — **delivered** (`4732698`)
 
 The highest-value phase. Everything Sentineth claims rests on returning the
 right passage.
@@ -74,17 +76,59 @@ front of a customer, and every later change is measured against it.
 
 ---
 
-## Phase 2 — Make the service survive more than one user
+## Phase 2 — Make the service survive more than one user — **delivered**
 
-- **2.1** — Get blocking work off the event loop.
+- **2.1** — Get blocking work off the event loop. Every synchronous call the
+  API still makes runs in a thread: the Qdrant client, the local embedding
+  model, the reranker, request-body buffering and file deletion. PDF
+  extraction and chunking left the API process altogether under 2.2.
 - **2.2** — Move ingestion out of the request entirely; upload becomes an
-  async 202 contract with a status to poll.
+  async 202 contract with a status to poll. Upload, delete and reindex all
+  answer 202 with a `Location` header and queue an `ingestion_jobs` row;
+  `GET /organizations/{org}/documents/{id}` is the status route. A separate
+  `python -m app.worker` process claims jobs with `SELECT ... FOR UPDATE SKIP
+  LOCKED` under a lease.
 - **2.3** — Bound the inputs: file size, page count, request body, query
-  length, concurrent jobs per organization.
+  length, concurrent jobs per organization. All of it lives in
+  `app/settings.py` with `SENTINETH_`-prefixed overrides, plus per-org
+  document count and storage quotas and per-minute upload and query limits.
 - **2.4** — Make timeouts and failure modes explicit at every provider call.
+  Every provider call has a deadline; a timeout is `PROVIDER_UNAVAILABLE`
+  (503, retryable) rather than a hung request, and the taxonomy gained
+  `SOURCE_MISSING` (410), `INPUT_TOO_LARGE` (413), `QUOTA_EXCEEDED` (429) and
+  `DOCUMENT_BUSY` (409).
+
+The queue is Postgres, not Redis. The job and the document row are written in
+one transaction, so "queued job with no document" and "document nothing will
+process" are unreachable states rather than states to reconcile. Redis buys
+throughput this phase does not need and adds a second system that can lose
+the association.
+
+**Acceptance criteria, each with a test:**
+
+- *Retries.* A transient provider failure is retried and leaves no duplicate
+  vectors. A crashed worker's job is reclaimed only after its lease expires.
+  Retries back off exponentially. The budget is finite: exhausting it
+  dead-letters the document as `FAILED` with `RETRIES_EXHAUSTED`, and a
+  failure that retrying cannot fix is not retried at all.
+- *Idempotency.* Point IDs are `uuid5` over document, `index_generation` and
+  chunk index — but deterministic IDs alone are not retry safety, because a
+  changed chunker regenerates different chunk IDs and the old points would
+  survive. So a re-ingest deletes the document's vectors before writing any.
+  A reindex after a chunking change leaves no stale vectors.
+- *Cancellation and deletion races.* Deleting a queued document cancels its
+  job. A document being processed rejects a conflicting delete or reindex
+  with 409 rather than racing the worker.
+- *Recovery across Postgres, files and Qdrant.* A delete leaves nothing in
+  any of the three. A document whose file is gone fails as `SOURCE_MISSING`
+  (410) and is not retried, because retrying cannot find bytes that do not
+  exist. Vectors belonging to failed or deleted documents are never returned
+  by search.
 
 **Done when:** a load test with concurrent uploads and queries keeps query
-latency flat while ingestion runs.
+latency flat while ingestion runs. `tests/test_postgres_jobs.py` asserts this
+against a real Postgres, along with six workers claiming six distinct jobs
+and a held lease not being stolen.
 
 ---
 
@@ -94,7 +138,10 @@ latency flat while ingestion runs.
   API keys.
 - **3.2** — Test the security boundary properly: missing, wrong, revoked and
   expired credentials against every route, including cross-organization
-  lifecycle actions.
+  lifecycle actions. Phase 2 took the first slice: every document route,
+  including the new status route, is asserted to reject a valid key belonging
+  to another organization. The rest — revoked, expired, malformed — waits for
+  the user and membership model here.
 - **3.3** — Append-only audit log of security and data events.
 - **3.4** — Ship an operable service: Dockerfile, health and readiness
   probes, metrics, configuration validated at startup.

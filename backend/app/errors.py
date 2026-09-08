@@ -32,8 +32,37 @@ class ExtractionFailed(DocumentProcessingError):
     status_code = 422
 
 
+class SourceMissing(DocumentProcessingError):
+    """The document row outlived the bytes it points at.
+
+    Distinct from ExtractionFailed because the two need opposite responses.
+    A file we cannot parse is a file: reindexing it will fail the same way
+    forever. A file that is gone means Postgres and object storage have
+    drifted apart, and the fix is to upload it again or restore it - which
+    the caller can only be told to do if the two are not reported as one.
+    """
+
+    code = "SOURCE_MISSING"
+    status_code = 410
+
+
 class ProviderUnavailable(DocumentProcessingError):
     """An embedding or vector-store call failed. Retrying may work."""
 
     code = "PROVIDER_UNAVAILABLE"
     status_code = 503
+
+
+class InputTooLarge(DocumentProcessingError):
+    code = "INPUT_TOO_LARGE"
+    status_code = 413
+
+
+class QuotaExceeded(DocumentProcessingError):
+    code = "QUOTA_EXCEEDED"
+    status_code = 429
+
+
+class DocumentBusy(DocumentProcessingError):
+    code = "DOCUMENT_BUSY"
+    status_code = 409

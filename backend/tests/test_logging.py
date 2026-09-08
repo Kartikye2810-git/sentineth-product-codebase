@@ -97,7 +97,7 @@ def test_an_inbound_request_id_is_reused_rather_than_replaced(client, log_stream
     assert [line["request_id"] for line in completed] == ["trace-me"]
 
 
-def test_a_failed_upload_logs_a_traceback_tagged_with_the_request_id(
+def test_a_rejected_upload_logs_its_code_and_request_id(
     client, organization, log_stream
 ):
     org_id = organization()
@@ -109,19 +109,9 @@ def test_a_failed_upload_logs_a_traceback_tagged_with_the_request_id(
 
     assert response.status_code == 415
 
-    tracebacks = [line for line in read_lines(log_stream) if "exception" in line]
-
-    assert tracebacks, "a failed ingest should log a traceback"
-    assert all(
-        "app.errors.UnsupportedMediaType" in line["exception"] for line in tracebacks
-    )
-    assert all(
-        line["request_id"] == response.headers["X-Request-ID"] for line in tracebacks
-    )
-    # Only the service that classifies the failure tags the line with a code.
-    assert any(
-        line.get("error_code") == "UNSUPPORTED_MEDIA_TYPE" for line in tracebacks
-    )
+    rejected = [line for line in read_lines(log_stream) if line.get("error_code") == "UNSUPPORTED_MEDIA_TYPE"]
+    assert rejected
+    assert all(line["request_id"] == response.headers["X-Request-ID"] for line in rejected)
 
 
 def test_the_request_id_contextvar_is_cleared_between_requests(client, log_stream):

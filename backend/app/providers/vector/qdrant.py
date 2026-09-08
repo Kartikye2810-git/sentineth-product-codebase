@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 from typing import Any
@@ -82,6 +83,13 @@ class QdrantVectorStore(VectorStore):
                     else None
                 ),
             )
+
+        config = self._client.get_collection(self.collection_name).config.params
+        if not isinstance(config.vectors, qmodels.VectorParams) or config.vectors.size != self.vector_size:
+            raise ValueError("Existing collection has incompatible vector dimensions. Use a new collection.")
+        actual_hybrid = bool(config.sparse_vectors and SPARSE_VECTOR_NAME in config.sparse_vectors)
+        if actual_hybrid != self.hybrid:
+            raise ValueError("Collection hybrid setting does not match configuration.")
 
         # Outside the create branch on purpose: a collection that predates
         # this index needs it too, and re-issuing an identical index is a
@@ -234,7 +242,7 @@ class QdrantVectorStore(VectorStore):
         if not points:
             return
 
-        self._client.upsert(
+        await asyncio.to_thread(self._client.upsert,
             collection_name=self.collection_name,
             points=points,
             wait=True,
@@ -246,6 +254,7 @@ class QdrantVectorStore(VectorStore):
         query_vector: list[float],
         limit: int = 5,
         sparse_query: tuple[list[int], list[float]] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if len(query_vector) != self.vector_size:
             raise ValueError(
@@ -270,6 +279,12 @@ class QdrantVectorStore(VectorStore):
             ]
         )
 
+        if document_ids == []:
+            return []
+        if document_ids is not None:
+            filter_clause.must.append(qmodels.FieldCondition(
+                key="document_id", match=qmodels.MatchAny(any=document_ids)))
+
         if sparse_query is not None and self.hybrid:
             indices, values = sparse_query
 
@@ -279,7 +294,7 @@ class QdrantVectorStore(VectorStore):
             # would be a constant picked by hand. RRF only reads positions,
             # which both lists genuinely have, and so needs no such
             # constant.
-            response = self._client.query_points(
+            response = await asyncio.to_thread(self._client.query_points,
                 collection_name=self.collection_name,
                 prefetch=[
                     qmodels.Prefetch(
@@ -302,7 +317,7 @@ class QdrantVectorStore(VectorStore):
                 with_payload=True,
             )
         else:
-            response = self._client.query_points(
+            response = await asyncio.to_thread(self._client.query_points,
                 collection_name=self.collection_name,
                 query=query_vector,
                 query_filter=filter_clause,
@@ -327,7 +342,7 @@ class QdrantVectorStore(VectorStore):
         ]
 
     async def delete_document(self, organization_id: str, document_id: str) -> None:
-        self._client.delete(
+        await asyncio.to_thread(self._client.delete,
             collection_name=self.collection_name,
             points_selector=qmodels.FilterSelector(filter=qmodels.Filter(must=[
                 qmodels.FieldCondition(key="organization_id", match=qmodels.MatchValue(value=str(organization_id))),

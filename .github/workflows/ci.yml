@@ -55,6 +55,8 @@ jobs:
         run: ruff check .
 
       - name: pytest
+        env:
+          TEST_POSTGRES_URL: ${{ env.DATABASE_URL }}
         run: python -m pytest
 
       - name: alembic upgrade head
@@ -88,6 +90,12 @@ jobs:
 
     env:
       QDRANT_URL: http://localhost:6333
+      # nemotron-3-embed-1b is the model the application runs, so score it
+      # when a key is reachable. Pull requests from forks get no secrets, so
+      # the step below falls back to the offline model rather than producing
+      # no number at all. Which one ran is printed in the report and in the
+      # PR comment, so the two can never be quoted as the same measurement.
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +135,14 @@ jobs:
         run: python eval/build_corpus.py
 
       - name: Score retrieval
-        run: python eval/harness.py --report eval-report.json
+        run: |
+          if [ -n "$NVIDIA_API_KEY" ]; then
+            provider=nvidia
+          else
+            echo "::notice::No NVIDIA_API_KEY in this context - scoring the offline fallback model, not the one production serves."
+            provider=local
+          fi
+          python eval/harness.py --provider "$provider" --report eval-report.json
 
       - uses: actions/upload-artifact@v4
         with:

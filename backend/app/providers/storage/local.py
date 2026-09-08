@@ -1,6 +1,11 @@
+import asyncio
+import hashlib
+import os
 import re
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
+from app.errors import ExtractionFailed, InputTooLarge
 from app.providers.storage.base import StorageProvider
 
 
@@ -59,9 +64,7 @@ class LocalStorageProvider(StorageProvider):
         if not path:
             return
 
-        file_path = Path(path)
-        if file_path.exists() and file_path.is_file():
-            file_path.unlink()
+        await asyncio.to_thread(Path(path).unlink, missing_ok=True)
 
     async def exists(
         self,
@@ -71,3 +74,31 @@ class LocalStorageProvider(StorageProvider):
             return False
 
         return Path(path).exists()
+
+    def save_stream(self, organization_id: str, document_id: str, filename: str,
+                    stream: BinaryIO, max_bytes: int) -> tuple[str, int, str]:
+        target = (self.base_dir / organization_id / document_id /
+                  self._sanitize_filename(filename)).resolve()
+        if self.base_dir not in target.parents:
+            raise ValueError("Invalid storage path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staging = target.with_name(target.name + ".partial")
+        size = 0
+        digest = hashlib.sha256()
+        try:
+            with staging.open("xb") as output:
+                while block := stream.read(64 * 1024):
+                    size += len(block)
+                    if size > max_bytes:
+                        raise InputTooLarge("Upload exceeds the file size limit.")
+                    digest.update(block)
+                    output.write(block)
+                if not size:
+                    raise ExtractionFailed("Uploaded document is empty.")
+                output.flush()
+                os.fsync(output.fileno())
+            staging.replace(target)
+        except BaseException:
+            staging.unlink(missing_ok=True)
+            raise
+        return str(target), size, digest.hexdigest()

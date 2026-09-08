@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from app.providers.embeddings.base import EmbeddingProvider, InputType
@@ -56,6 +57,9 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         if not texts:
             return []
 
+        return await asyncio.to_thread(self._embed_sync, texts)
+
+    def _embed_sync(self, texts):
         self._warn_if_truncated(texts)
 
         embeddings = self._model.encode(

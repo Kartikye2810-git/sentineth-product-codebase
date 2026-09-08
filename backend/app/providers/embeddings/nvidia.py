@@ -53,6 +53,8 @@ class NvidiaEmbeddingProvider(EmbeddingProvider):
         )
         self.batch_size = batch_size
 
+        kwargs.setdefault("timeout", 10.0)
+        kwargs.setdefault("max_retries", 2)
         self._client = AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,

@@ -1,7 +1,7 @@
 """Compare two harness reports on the questions they share.
 
-A retrieval change is scored on the same 102 questions before and after, so
-the runs are paired and the interesting quantity is not the gap between two
+A retrieval change is scored on the same questions before and after, so the
+runs are paired and the interesting quantity is not the gap between two
 percentages - it is which individual questions changed answer. Two runs can
 differ by four points of recall@5 with sixteen questions moving in each
 direction, which is noise, or with four moving one way and none the other,
@@ -11,6 +11,10 @@ The p-value is McNemar's exact test over the discordant questions: given
 that a question changed, how surprising is it that so many changed in the
 same direction? Computed exactly rather than by the chi-squared
 approximation because the counts here are small.
+
+Pairs the recall-scored questions, which is what a report's `results` block
+holds. The unanswerable and conflict families are not hit-or-miss at a rank
+and are reported in their own blocks; compare those by reading them.
 
     python eval/compare.py before.json after.json
 """

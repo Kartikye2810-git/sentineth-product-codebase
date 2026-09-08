@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID
 
 from app.providers.embeddings.base import EmbeddingProvider
@@ -21,6 +22,7 @@ async def retrieve(
     vector_store: VectorStore,
     limit: int = 5,
     rerank_provider: RerankProvider | None = None,
+    document_ids: list[str] | None = None,
 ) -> list[dict]:
     if not query or not query.strip():
         raise ValueError("Query cannot be empty.")
@@ -30,6 +32,9 @@ async def retrieve(
         raise ValueError("Limit must be at least 1.")
     if limit > max_limit:
         raise ValueError(f"Limit cannot exceed {max_limit}.")
+
+    if document_ids == []:
+        return []
 
     cleaned = query.strip()
 
@@ -53,10 +58,11 @@ async def retrieve(
         # index. Encoding it costs a regex over one short question, which
         # is cheaper than asking the store what it supports.
         sparse_query=encode_query(cleaned),
+        document_ids=document_ids,
     )
 
     if rerank_provider is not None:
-        results = _rerank(rerank_provider, cleaned, results, limit)
+        results = await asyncio.to_thread(_rerank, rerank_provider, cleaned, results, limit)
 
     normalized_results: list[dict] = []
     for result in results:

@@ -134,6 +134,7 @@ class FakeVectorStore(VectorStore):
         query_vector: list[float],
         limit: int = 5,
         sparse_query: tuple[list[int], list[float]] | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if limit <= 0:
             return []
@@ -144,6 +145,7 @@ class FakeVectorStore(VectorStore):
             point_id: point
             for point_id, point in self.points.items()
             if point["payload"].get("organization_id") == org_id
+            and (document_ids is None or point["payload"].get("document_id") in document_ids)
         }
 
         dense = self._rank(
