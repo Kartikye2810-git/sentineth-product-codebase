@@ -61,6 +61,7 @@ class DocumentResponse(BaseModel):
     """
 
     id: UUID
+    source_id: UUID
     filename: str
     content_type: str
     file_size: int

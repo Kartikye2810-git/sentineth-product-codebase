@@ -2,7 +2,7 @@
 
 > **Purpose:** This document is the source of truth for AI coding agents and human contributors working on Sentineth AI.
 >
-> **Project status:** Phases 0, 1 and 2 of `docs/ROADMAP.md` are delivered. The document-RAG pipeline works end to end, retrieval quality is measured rather than asserted, and ingestion runs in a durable background worker behind an async upload contract. Phase 3 is next: real identity, and the ability to operate the service.
+> **Project status:** Phases 0–3 are implemented. Phase 4 is in progress: the Source foundation (4.1) links PDF payloads to stable, tenant-scoped ingestion identities. Entities, relationships, extraction and combined retrieval remain upcoming.
 >
 > **Sequencing lives in `docs/ROADMAP.md`, not here.** When this file and the roadmap disagree about what comes next, the roadmap wins.
 
@@ -417,6 +417,27 @@ Organization scoping is a core architectural rule.
 ---
 
 # 9. Organization Isolation
+
+Every document now has a non-null `source_id`. `Source` owns ingestion origin,
+namespace/external identity, URI, actor and sync timestamps; `Document` retains
+PDF/file metadata and chunks. A composite foreign key enforces matching tenants.
+The upload and worker transactions keep source states current (`PENDING`,
+`PROCESSING`, `SYNCED`, `FAILED`, `DELETING`, `DELETED`). Reindex retains source
+identity and the previous successful sync timestamp until it succeeds again.
+
+`GET /organizations/{id}/sources` supports pagination, `origin`, `sync_state`
+and `include_deleted`; `GET /organizations/{id}/sources/{source_id}` exposes
+one source. Viewers can read these endpoints. Document responses include
+`source_id`. URIs for uploads are relative API paths, never storage paths.
+Deletion retains a source tombstone, not the PDF, chunks or vectors. Future
+claims must treat a deleted source as withdrawn evidence.
+
+Apply migration `a14b72d3e805` with API/workers stopped before deploying this
+version. It backfills existing documents without re-embedding; legacy
+`last_synced_at` uses the READY document's `updated_at` as a best available
+historical timestamp. Existing source identity is not inferred from filenames.
+No connectors or entity extraction ship in this milestone.
+
 
 Every document and vector belongs to an organization.
 
@@ -945,6 +966,7 @@ Important entities currently include:
 Organization
 OrganizationApiKey
 OrganizationRateLimit
+Source
 Document
 DocumentChunk
 IngestionJob

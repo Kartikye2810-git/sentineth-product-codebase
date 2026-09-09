@@ -21,6 +21,7 @@ from app.dependencies import get_embedding_provider, get_storage_provider, get_v
 from app.errors import DocumentProcessingError, ProviderUnavailable
 from app.logging_config import configure_logging, request_id_var
 from app.services.ingestion_service import ingest_document
+from app.services.source_service import set_sync_state
 from app.settings import get_settings
 
 
@@ -46,6 +47,7 @@ def claim(session_factory=SessionLocal) -> tuple[UUID, int] | None:
             job.status, job.error_code = "FAILED", "RETRIES_EXHAUSTED"
             document.status, document.error_code = "FAILED", "RETRIES_EXHAUSTED"
             job.lease_until = None
+            set_sync_state(db, document, "FAILED", "RETRIES_EXHAUSTED")
             record(db, "document.failed", document.organization_id, document.id,
                    job_id=str(job.id), error_code="RETRIES_EXHAUSTED")
             db.commit()
@@ -54,6 +56,7 @@ def claim(session_factory=SessionLocal) -> tuple[UUID, int] | None:
         job.status = "PROCESSING"
         job.lease_until = now + timedelta(seconds=settings.job_lease_seconds)
         document.status = "DELETING" if job.operation == "DELETE" else "PROCESSING"
+        set_sync_state(db, document, "DELETING" if job.operation == "DELETE" else "PROCESSING")
         result = (job.id, job.attempts)
         db.commit()
         return result
@@ -83,11 +86,14 @@ async def execute_once(session_factory=SessionLocal, embedding_provider=None,
                 await storage.delete(document.storage_path)
                 db.delete(job)
                 db.flush()
+                set_sync_state(db, document, "DELETED")
+                record(db, "source.deleted", document.organization_id, document.source_id)
                 db.delete(document)
             else:
                 provider = embedding_provider or get_embedding_provider()
                 await ingest_document(db, document, provider, store)
                 job.status, job.error_code, job.lease_until = "SUCCEEDED", None, None
+                set_sync_state(db, document, "SYNCED")
             record(db, "document.deleted" if job.operation == "DELETE" else "document.indexed",
                    document.organization_id, document.id,
                    job_id=str(job_id), attempt=attempt)
@@ -108,6 +114,8 @@ async def execute_once(session_factory=SessionLocal, embedding_provider=None,
             job.available_at = utcnow() + timedelta(seconds=get_settings().job_retry_seconds * 2 ** (attempt - 1))
             if document:
                 document.status = ("DELETING" if job.operation == "DELETE" else "QUEUED") if retry else "FAILED"
+                source_state = ("DELETING" if job.operation == "DELETE" else "PENDING") if retry else "FAILED"
+                set_sync_state(db, document, source_state, code)
                 document.error_code = code
                 document.error_message = "Processing failed; retry scheduled." if retry else "Processing failed. Reindex or delete this document."
             record(db, "document.retry_scheduled" if retry else "document.failed",

@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.auth import router as auth_router
 from app.api.documents import router as documents_router
 from app.api.organizations import router as organizations_router
+from app.api.sources import router as sources_router
 from app.body_limit import BodyLimitMiddleware
 from app.errors import DocumentProcessingError
 from app.health import router as health_router
@@ -136,6 +137,7 @@ async def missing_document(request, exc):
 app.include_router(auth_router)
 app.include_router(organizations_router)
 app.include_router(documents_router)
+app.include_router(sources_router)
 app.include_router(health_router)
 app.add_api_route("/metrics", metrics, methods=["GET"], include_in_schema=False)
 

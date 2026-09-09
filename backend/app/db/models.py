@@ -1,7 +1,16 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, CheckConstraint, DateTime, ForeignKey, String, Text
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.clock import utcnow
@@ -43,8 +52,38 @@ class Organization(Base):
     )
 
 
+class Source(Base):
+    """Stable ingestion identity; payloads may disappear while provenance survives."""
+    __tablename__ = "sources"
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_source_tenant"),
+        UniqueConstraint("organization_id", "origin", "namespace", "external_id", name="uq_source_origin"),
+        CheckConstraint("sync_state IN ('PENDING','PROCESSING','SYNCED','FAILED','DELETING','DELETED')", name="source_sync_state"),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(ForeignKey("organizations.id"), index=True)
+    origin: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Future connector account/workspace scope, not a credential or connection URL.
+    namespace: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    external_id: Mapped[str] = mapped_column(String(500), nullable=False)
+    uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sync_state: Mapped[str] = mapped_column(String(20), default="PENDING", nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    created_by_user_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (
+        ForeignKeyConstraint(["source_id", "organization_id"], ["sources.id", "sources.organization_id"], name="fk_document_source_tenant"),
+        UniqueConstraint("source_id", name="uq_documents_source_id"),
+    )
+    source_id: Mapped[UUID] = mapped_column(nullable=False)
+
 
     id: Mapped[UUID] = mapped_column(
         primary_key=True,
