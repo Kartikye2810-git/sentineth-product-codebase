@@ -4,7 +4,7 @@ The single source of truth for what Sentineth builds next, and in what order.
 `info.md` section 26 and `docs/PROJECT_STATUS_SEPT_2026.md` used to carry
 roadmaps of their own; both now point here.
 
-Phases 0 through 3 are delivered. Phase 4 is in progress; milestone 4.1 is implemented.
+Phases 0 through 4 are delivered. Phase 5 is next.
 
 Phases are sequential. Each one exists because the next phase depends on it,
 and the "Done when" line is the test for moving on — not a feeling of
@@ -195,9 +195,9 @@ can tell them what happened when something goes wrong.
 
 ---
 
-## Phase 4 — The knowledge model: from documents to company intelligence
+## Phase 4 — The knowledge model: from documents to company intelligence — **delivered**
 
-- **4.1 — Source foundation (implemented).** Each PDF payload belongs to a
+- **4.1 — Source foundation.** Each PDF payload belongs to a
   stable organization-scoped `Source`: origin, connector namespace, external ID,
   URI, actor, timestamps and sync state. Existing PDFs are backfilled without
   changing document/chunk/vector IDs. Upload, worker retries, reindex and delete
@@ -205,23 +205,24 @@ can tell them what happened when something goes wrong.
   respect the existing roles. Deletion removes payloads and vectors while keeping
   a minimal source tombstone for future provenance; default listings hide it.
   Only uploads produce sources today; connector implementations remain Phase 5.
-- **4.2 — Entities (next).** Start with Person, Project and Decision as the
-  initial engineering-oriented vocabulary, refining it with design-partner
-  feedback. Store tenant, actor, chunk provenance, confidence and validity dates.
+- **4.2 — Entities.** Person, Project and Decision form the initial
+  engineering-oriented vocabulary, refining it through design-partner feedback.
+  Store tenant, actor, chunk provenance, confidence and validity dates.
   Model mentions separately from canonical entities so identical names do not
   silently merge different people or projects.
 - **4.3 — Relationships.** Use typed PostgreSQL edges with supporting chunks,
   confidence and `valid_from`/`valid_to`; distinguish recorded time from the
   period when a claim applies. Build the first cross-source ownership/decision
   workflow before adding more entity types or a graph database.
-- **4.4 — Reviewable extraction.** Run a separate durable extraction pass over
+- **4.4 — Reviewable extraction.** A separate durable extraction pass runs over
   READY sources. Treat source text as untrusted. Write proposals with provenance,
   explicit review status and a correction path; confidence alone does not make
   a claim authoritative. Invalidate affected evidence on reindex/deletion.
-- **4.5 — Combined retrieval.** Combine structured entity/relationship lookup
+- **4.5 — Combined retrieval.** Structured entity/relationship lookup is combined
   with existing vector retrieval, add time/metadata filters and structured
   citations. Extend the current evaluation set with cross-source relationship
-  questions before changing query routing.
+  questions. Queries traverse a bounded two-hop reviewed graph and return the
+  stable source, document and chunk IDs behind each relationship citation.
 
 **Refinements:** connector namespaces prevent external-ID collisions between
 workspaces; source tombstones preserve evidence identity after deletion. Keep

@@ -84,6 +84,7 @@ def payload_for(chunk: DocumentChunk, document: Document) -> dict[str, Any]:
     # that only shows up for the customers who were already here.
     return {
         "organization_id": str(document.organization_id),
+        "source_id": str(document.source_id),
         "document_id": str(document.id),
         "chunk_id": str(chunk.id),
         "chunk_index": chunk.chunk_index,

@@ -16,11 +16,12 @@ from sqlalchemy import and_, delete, or_, select
 from app.audit import record
 from app.clock import utcnow
 from app.db.database import SessionLocal
-from app.db.models import Document, DocumentChunk, IngestionJob
+from app.db.models import Document, DocumentChunk, IngestionJob, KnowledgeJob
 from app.dependencies import get_embedding_provider, get_storage_provider, get_vector_store
 from app.errors import DocumentProcessingError, ProviderUnavailable
 from app.logging_config import configure_logging, request_id_var
 from app.services.ingestion_service import ingest_document
+from app.services.knowledge_service import enqueue_knowledge, withdraw_document_knowledge
 from app.services.source_service import set_sync_state
 from app.settings import get_settings
 
@@ -81,9 +82,11 @@ async def execute_once(session_factory=SessionLocal, embedding_provider=None,
             storage = storage_provider or get_storage_provider()
             # Repeated cleanup is safe, including after a partial upsert/crash.
             await store.delete_document(str(document.organization_id), str(document.id))
+            withdraw_document_knowledge(db, document)
             db.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
             if job.operation == "DELETE":
                 await storage.delete(document.storage_path)
+                db.execute(delete(KnowledgeJob).where(KnowledgeJob.document_id == document.id))
                 db.delete(job)
                 db.flush()
                 set_sync_state(db, document, "DELETED")
@@ -94,6 +97,7 @@ async def execute_once(session_factory=SessionLocal, embedding_provider=None,
                 await ingest_document(db, document, provider, store)
                 job.status, job.error_code, job.lease_until = "SUCCEEDED", None, None
                 set_sync_state(db, document, "SYNCED")
+                enqueue_knowledge(db, document)
             record(db, "document.deleted" if job.operation == "DELETE" else "document.indexed",
                    document.organization_id, document.id,
                    job_id=str(job_id), attempt=attempt)

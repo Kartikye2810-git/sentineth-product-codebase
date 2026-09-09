@@ -2,7 +2,7 @@
 # Uses the existing local database. Run migrations and initialize-vectors first.
 x-app: &app
   build: .
-  image: sentineth:phase3
+  image: sentineth:phase4
   env_file: .env
   environment:
     QDRANT_URL: http://qdrant:6333
@@ -27,5 +27,10 @@ services:
   worker:
     <<: *app
     command: [python, -m, app.worker]
+    healthcheck:
+      disable: true
+  knowledge-worker:
+    <<: *app
+    command: [python, -m, app.knowledge_worker]
     healthcheck:
       disable: true

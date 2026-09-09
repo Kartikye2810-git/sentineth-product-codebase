@@ -13,8 +13,10 @@ storage are all bounded. Requests now come from someone: people sign in and hold
 a revocable session, machines hold a role-scoped API key, every route checks
 membership, and who did what to which document is written to an append-only
 audit log. There is a container image, a readiness check that actually asks
-Postgres and Qdrant, metrics, and a rehearsed restore procedure. There is still
-no frontend, and PDF is the only accepted file type.
+Postgres and Qdrant, metrics, and a rehearsed restore procedure. A second durable
+worker proposes people, projects, decisions and temporal relationships; human
+review turns those proposals into cross-source answer context with exact
+provenance. There is still no frontend, and PDF is the only accepted file type.
 
 ## How it works
 
@@ -32,12 +34,17 @@ worker (separate process)       |
                                 |
 GET the Location until status is READY
                                 |
+knowledge worker -> untrusted-text extraction -> review proposals
+                                |
+human review -> canonical entities + temporal relationships
+                                |
 question                        |
   -> embed the question         |
   -> vector search, filtered by organization_id  <----+
-  -> assemble the retrieved chunks into a prompt
+  -> bounded two-hop lookup over reviewed facts
+  -> assemble retrieved chunks and reviewed facts into a prompt
   -> LLM (OpenRouter) answers using only that context
-  -> answer + citations, with page numbers
+  -> answer + document and relationship citations, with source IDs
 ```
 
 Postgres holds documents, chunk metadata and the job queue. Qdrant holds the
@@ -63,6 +70,7 @@ to it must follow.
 | Vectors    | Qdrant 1.19                                   |
 | Embeddings | NVIDIA `nemotron-3-embed-1b` (2048 dims), `all-MiniLM-L6-v2` offline |
 | Ingestion  | Postgres-backed job queue, worker process      |
+| Knowledge  | Reviewed PostgreSQL entities and temporal edges |
 | LLM        | OpenRouter (OpenAI-compatible API)            |
 | Extraction | pypdf                                         |
 | Identity   | Argon2id passwords, opaque bearer sessions, role-scoped API keys |
@@ -186,7 +194,8 @@ alembic upgrade head
 This creates `organizations`, `organization_api_keys`, `documents`,
 `document_chunks`, `ingestion_jobs`, `organization_rate_limits`, `users`,
 `memberships`, `user_sessions`, `invitations`, `auth_throttles`,
-`audit_events` and `usage_records`.
+`audit_events`, `usage_records`, `sources`, `knowledge_jobs`, `entities`,
+`entity_mentions`, `relationships`, their evidence links, and review proposals.
 
 ### 5. Create the first account
 
@@ -210,18 +219,19 @@ python -m uvicorn app.main:app --reload
 
 Interactive docs: http://127.0.0.1:8000/docs
 
-### 7. Start the worker
+### 7. Start the workers
 
 In a second terminal, from `backend/`:
 
 ```bash
 python -m app.worker
+# In a third terminal:
+python -m app.knowledge_worker
 ```
 
-Nothing is indexed without it. The API accepts an upload, writes the file and
-queues a job; the worker is what turns that job into chunks and vectors. Run
-as many as you like - they claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`
-and cannot take each other's work.
+Nothing is indexed without the ingestion worker. The knowledge worker performs
+the slower second pass over READY documents and writes review proposals. Run as
+many of either as you need; row locks stop workers from taking the same job.
 
 With `EMBEDDING_PROVIDER=local`, the first request that needs embeddings
 downloads the MiniLM weights (about 90 MB) into the Hugging Face cache and
@@ -314,9 +324,13 @@ same place, for the same reason.
 
 | Role   | Can                                                                 |
 | ------ | ------------------------------------------------------------------- |
-| viewer | read documents, search, query                                       |
+| viewer | read documents, knowledge, search and query                         |
 | member | everything a viewer can, plus upload, reindex and delete            |
 | owner  | everything a member can, plus keys, audit history and usage         |
+
+Creating knowledge and reviewing extraction proposals requires a human member
+or owner. Machine keys may read the graph but cannot make model output
+authoritative.
 
 Membership itself - inviting, changing a role, removing someone - needs an
 owner who is a person, not a key. An integration that leaks should not be able
@@ -363,6 +377,11 @@ organization will not let its last human owner go.
 | POST   | `/organizations/{org_id}/documents/{doc_id}/reindex` | member   | Queue a re-chunk and re-embed, 202  |
 | POST   | `/organizations/{org_id}/search`                 | viewer       | Vector search, returns matching chunks |
 | POST   | `/organizations/{org_id}/query`                  | viewer       | Retrieval-augmented answer + citations |
+| GET    | `/organizations/{org_id}/knowledge/jobs`         | viewer       | Extraction status by document generation |
+| GET    | `/organizations/{org_id}/knowledge/proposals`    | viewer       | Review queue with confidence and chunk provenance |
+| PATCH  | `/organizations/{org_id}/knowledge/proposals/{id}` | human member | Accept, resolve or reject a proposal |
+| GET/POST/PATCH | `/organizations/{org_id}/knowledge/entities...` | viewer/human member | Read or correct canonical entities |
+| GET/POST/PATCH | `/organizations/{org_id}/knowledge/relationships...` | viewer/human member | Read or correct temporal edges |
 
 Every route under `/organizations/{org_id}` requires
 `Authorization: Bearer <credential>` and membership of that organization; a
@@ -399,8 +418,10 @@ revoked, expired, from another organization, or below the role the route needs.
 Repeated login, invitation and password-change attempts are throttled per
 account and per source address, and answer 429 with `Retry-After`.
 
-`search` and `query` both accept `{"query": str, "limit": int}`, where `limit`
-is 1 to 20 and defaults to 5. `query` caps the question at 2000 characters.
+`search` and `query` accept `query`, `limit`, optional `source_origins`, and
+optional `created_after`/`created_before` source timestamps. `query` also accepts
+`as_of` for temporal graph lookup. `limit` is 1 to 20 and defaults to 5; the
+question is capped at 2000 characters.
 
 ## Tests
 
@@ -512,8 +533,9 @@ your terminal and slows requests down.
 
 ## Running it as a service
 
-`Dockerfile` builds one image that runs either process - `uvicorn app.main:app`
-for the API, `python -m app.worker` for the worker - as a non-root user, with a
+`Dockerfile` builds one image that runs the API, `python -m app.worker` for
+ingestion, or `python -m app.knowledge_worker` for reviewed knowledge extraction
+as a non-root user, with a
 `HEALTHCHECK` that hits `/ready`. The default build installs no local model
 weights, because the default embedding provider is hosted; `--build-arg
 WITH_LOCAL_MODELS=true` adds torch and MiniLM for offline use.
@@ -531,7 +553,7 @@ localhost for a reverse proxy to terminate TLS in front of.
 revision, asks Qdrant about the collection's dimension and hybrid config, and
 checks the storage directory is writable - it answers 503 when any of those is
 wrong, which is what a load balancer should act on. `/metrics` exposes request
-counts and latency, retrieval hit rate, job states and queue age; per-organization
+counts and latency, retrieval hit rate, ingestion and knowledge job states and queue age; per-organization
 LLM cost is on `/organizations/{org_id}/usage` instead, where it is scoped to a
 tenant rather than to the process.
 
@@ -558,7 +580,7 @@ procedure.
 sentineth/
   info.md                    architecture, conventions, and rules for changes
   docker-compose.yml         Postgres + Qdrant
-  compose.app.yml            API and worker on top of those
+  compose.app.yml            API and both workers on top of those
   Dockerfile                 one image, two commands
   deploy/                    production compose file and env template
   .env.example               template for .env
@@ -569,6 +591,7 @@ sentineth/
     app/
       main.py                app wiring, middleware, routers
       worker.py              claims and runs ingestion jobs
+      knowledge_worker.py    proposes entities and relationships from READY sources
       settings.py            validated settings and resource limits
       security.py            authentication and role checks
       audit.py               append-only audit trail
@@ -581,9 +604,11 @@ sentineth/
       dependencies.py        cached provider factories
       schemas.py             request/response models
       identity_schemas.py    auth, membership, audit models
+      knowledge_schemas.py   entity, relationship and proposal models
       api/auth.py            signup, login, logout, invitations
       api/organizations.py   organizations, members, keys, audit, usage
       api/documents.py       upload, status, list, delete, reindex, search, query
+      api/knowledge.py       extraction review, entities and temporal relationships
       services/              document, chunking, retrieval, query
       providers/             embeddings, llm, vector, storage adapters
       db/                    engine, session, models

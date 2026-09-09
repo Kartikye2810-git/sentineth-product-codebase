@@ -81,14 +81,15 @@ class Settings(BaseSettings):
     def validate_runtime(self, role="api"):
         if self.environment == "test":
             return
-        if self.embedding_provider == "nvidia" and not self.nvidia_api_key.get_secret_value():
+        if (role in {"api", "worker"} and self.embedding_provider == "nvidia"
+                and not self.nvidia_api_key.get_secret_value()):
             raise ValueError("NVIDIA_API_KEY is required for the selected embedding provider")
         if self.embedding_provider == "local" or self.rerank:
             from importlib.util import find_spec
 
             if find_spec("sentence_transformers") is None:
                 raise ValueError("Local models require the image built with WITH_LOCAL_MODELS=true")
-        if role == "api" and not self.openrouter_api_key.get_secret_value():
+        if role in {"api", "knowledge-worker"} and not self.openrouter_api_key.get_secret_value():
             raise ValueError("OPENROUTER_API_KEY is required for the answer provider")
         if self.environment == "production":
             if not self.database_url.get_secret_value().startswith("postgresql"):
@@ -110,6 +111,8 @@ class Settings(BaseSettings):
     max_pages: int = Field(default=500, gt=0)
     max_extracted_chars: int = Field(default=2_000_000, gt=0)
     max_chunks: int = Field(default=5000, gt=0)
+    knowledge_batch_chars: int = Field(default=12_000, ge=1000, le=100_000)
+    max_knowledge_proposals: int = Field(default=1000, ge=1, le=10_000)
     max_documents_per_org: int = Field(default=1000, gt=0)
     max_storage_bytes_per_org: int = Field(default=1024 * 1024 * 1024, gt=0)
     max_pending_jobs_per_org: int = Field(default=10, gt=0)

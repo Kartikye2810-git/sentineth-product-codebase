@@ -1,9 +1,9 @@
-# Phase 3 operations guide
+# Phase 4 operations guide
 
-Sentineth is an API and a separate durable ingestion worker. Nemotron remains
+Sentineth is an API with separate durable ingestion and knowledge workers. Nemotron remains
 the default embedding model; OpenRouter generates answers. MiniLM remains an
-explicit offline configuration. Phase 3 adds identity and operations without
-changing retrieval ranking or introducing Phase 4's knowledge model.
+explicit offline configuration. The configured answer LLM also performs the
+second-pass extraction, but its claims remain proposals until a human reviews them.
 
 There is no public deployment yet. The founder has no hosting server or domain;
 this package can be verified locally and deployed when that destination exists.
@@ -21,6 +21,8 @@ python -m app.admin initialize-vectors
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 # In a separate process:
 python -m app.worker
+# In another process:
+python -m app.knowledge_worker
 ```
 
 For a Phase 2 organization, supply `--organization <UUID>` when creating its
@@ -42,6 +44,8 @@ are stored. Human sessions expire after 12 hours by default.
 | --- | --- | --- | --- |
 | List/read documents, search, ask questions | Yes | Yes | Yes |
 | Upload, delete, reindex | No | Yes | Yes |
+| Read entities, relationships and extraction proposals | Yes | Yes | Yes |
+| Review proposals; create or correct knowledge | No | Human only | Human only |
 | Create/list/revoke API keys, audit history, usage | No | No | Yes |
 | Invite people, list/edit/remove members | No | No | Human owner only |
 | Rotate the authenticating API key | Yes | Yes | Yes |
@@ -93,7 +97,7 @@ header trust.
 ## Build and deploy
 
 ```bash
-docker build -t sentineth:phase3 .
+docker build -t sentineth:phase4 .
 ```
 
 The default image contains the hosted-model dependencies, runs as UID 10001,
@@ -111,10 +115,11 @@ Local Compose can reuse the existing database services:
    into containers, relocate its paths to `/data/documents` using the procedure
    below. Verify the bind mount is writable by UID 10001.
 5. Run `docker compose -f docker-compose.yml -f compose.app.yml run --rm api
-   python -m app.admin initialize-vectors`, then start the API and worker with
+   python -m app.admin initialize-vectors`, then start the API and both workers with
    `docker compose -f docker-compose.yml -f compose.app.yml up -d`.
 6. Visit `http://127.0.0.1:8000/docs`, log in, upload a PDF, poll its `Location`
-   until `READY`, and ask a question with a filename/page citation.
+   until `READY`, let both workers finish, review proposals under
+   `/organizations/{id}/knowledge`, and ask a question with source provenance.
 
 For a fresh public deployment use `deploy/compose.production.yml` with external
 private PostgreSQL/Qdrant, a reviewed image tag in `SENTINETH_IMAGE`, a copy of
@@ -134,7 +139,8 @@ is intentional). The audit trigger rejects bulk UPDATE/DELETE/TRUNCATE, but a
 schema administrator can remove that trigger.
 
 Deploy one API process per container so its Prometheus counters have a clear
-process boundary. Run workers separately. Apply migrations as a release step
+process boundary. Run the ingestion and knowledge workers separately. Apply
+migrations as a release step
 with migration credentials before starting the new version, not independently
 in every replica. The included worker has restart behavior, but no separate
 heartbeat probe yet; watch queue age and document failures.
@@ -153,6 +159,7 @@ heartbeat probe yet; watch queue age and document failures.
   never presented as zero; `requests_with_reported_cost` indicates coverage.
   These are observed completed provider responses, not a billing ledger:
   calls whose connection drops before usage arrives may still be billed.
+- `sentineth_knowledge_jobs{state=...}` reports the durable extraction queue.
 - `/organizations/{id}/audit-events`: owner-only history with actor, resource,
   UTC timestamp and request ID. Supports `limit` (maximum 100) and `offset`.
 
@@ -274,7 +281,7 @@ mount is verified from the container.
 python scripts/rehearse_restore.py --postgres-container sentineth-postgres
 # Synthetic policy only, real NVIDIA embeddings and a live container/LLM check:
 python scripts/rehearse_restore.py --postgres-container sentineth-postgres \
-  --live-provider --image sentineth:phase3
+  --live-provider --image sentineth:phase4
 ```
 
 The script creates uniquely named disposable databases and collections, tests

@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class OrganizationCreate(BaseModel):
@@ -88,11 +88,38 @@ class DocumentListResponse(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     limit: int = Field(default=5, ge=1, le=20)
+    source_origins: list[str] | None = Field(None, max_length=10)
+    created_after: datetime | None = None
+    created_before: datetime | None = None
+
+    @field_validator("created_after", "created_before")
+    @classmethod
+    def _filter_time(cls, value):
+        if value is not None and value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+
+    @field_validator("source_origins")
+    @classmethod
+    def _origins(cls, value):
+        if value is None:
+            return value
+        cleaned = [item.strip().lower() for item in value]
+        if any(not item or len(item) > 50 for item in cleaned) or len(set(cleaned)) != len(cleaned):
+            raise ValueError("Source origins must be unique names of at most 50 characters")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_period(self):
+        if self.created_after and self.created_before and self.created_before <= self.created_after:
+            raise ValueError("created_before must be after created_after")
+        return self
 
 
 class SearchResult(BaseModel):
     id: str | None = None
     score: float | None = None
+    source_id: str | None = None
     document_id: str | None = None
     chunk_id: str | None = None
     chunk_index: int | None = None
@@ -106,18 +133,28 @@ class SearchResponse(BaseModel):
     results: list[SearchResult] = []
 
 
-class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=2000)
-    limit: int = Field(default=5, ge=1, le=20)
+class QueryRequest(SearchRequest):
+    as_of: datetime | None = None
+
+    @field_validator("as_of")
+    @classmethod
+    def _as_of(cls, value):
+        return SearchRequest._filter_time(value)
 
 
 class QuerySource(BaseModel):
+    kind: str = "document"
+    source_id: str | None = None
     document_id: str | None = None
     chunk_id: str | None = None
     filename: str | None = None
     chunk_index: int | None = None
     page_number: int | None = None
     score: float | None = None
+    relationship_id: str | None = None
+    subject_id: str | None = None
+    predicate: str | None = None
+    object_id: str | None = None
 
 
 class QueryResponse(BaseModel):

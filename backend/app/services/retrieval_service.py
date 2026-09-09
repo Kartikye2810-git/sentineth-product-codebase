@@ -73,6 +73,7 @@ async def retrieve(
         item = {
             "id": result.get("id"),
             "score": result.get("score"),
+            "source_id": payload.get("source_id"),
             "document_id": payload.get("document_id"),
             "chunk_id": payload.get("chunk_id"),
             "chunk_index": payload.get("chunk_index"),
