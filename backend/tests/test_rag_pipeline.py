@@ -271,6 +271,7 @@ def test_same_filename_twice_does_not_overwrite(
 
 
 PUBLIC_DOCUMENT_FIELDS = {
+    "source_id",
     "id",
     "filename",
     "content_type",

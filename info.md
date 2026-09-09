@@ -2,7 +2,7 @@
 
 > **Purpose:** This document is the source of truth for AI coding agents and human contributors working on Sentineth AI.
 >
-> **Project status:** Phases 0, 1 and 2 of `docs/ROADMAP.md` are delivered. The document-RAG pipeline works end to end, retrieval quality is measured rather than asserted, and ingestion runs in a durable background worker behind an async upload contract. Phase 3 is next: real identity, and the ability to operate the service.
+> **Project status:** Phases 0–4 are implemented. Sources now feed a reviewable company-knowledge layer of canonical entities, temporal relationships and provenance-aware cross-source answers. Phase 5 connectors are next.
 >
 > **Sequencing lives in `docs/ROADMAP.md`, not here.** When this file and the roadmap disagree about what comes next, the roadmap wins.
 
@@ -64,6 +64,11 @@ The service currently supports:
 14. Returning an answer with citations that carry filename and page number
 15. Recording who did each of those, append-only, readable by an owner
 16. Reporting liveness, readiness, metrics and per-organization LLM usage
+17. Running a durable second-pass extraction job that proposes people, projects,
+    decisions and relationships
+18. Letting human members accept, resolve or reject every proposed claim
+19. Answering through reviewed two-hop relationships with source, document and
+    chunk provenance and optional time/source filters
 
 The working flow is:
 
@@ -131,6 +136,7 @@ sentineth/
 │   │   │   ├── extraction_service.py
 │   │   │   ├── ingestion_service.py
 │   │   │   ├── lexical_service.py
+│   │   │   ├── knowledge_service.py
 │   │   │   ├── query_service.py
 │   │   │   └── retrieval_service.py
 │   │   ├── admin.py              operator CLI: users, owners, passwords
@@ -142,6 +148,8 @@ sentineth/
 │   │   ├── errors.py             failure taxonomy and HTTP mapping
 │   │   ├── health.py             /live and /ready
 │   │   ├── identity_schemas.py   auth, membership, audit models
+│   │   ├── knowledge_schemas.py  entities, edges, proposals and evidence
+│   │   ├── knowledge_worker.py   durable second-pass extraction
 │   │   ├── logging_config.py     structured JSON logging
 │   │   ├── main.py
 │   │   ├── observability.py      metrics and usage recording
@@ -157,8 +165,8 @@ sentineth/
 │   ├── storage/
 │   │   └── documents/
 │   └── ...
-├── Dockerfile                    one image, API or worker
-├── compose.app.yml               API and worker on top of the data services
+├── Dockerfile                    one image, API or either worker
+├── compose.app.yml               API and both workers on top of the data services
 ├── deploy/                       production compose file and env template
 ├── docs/ROADMAP.md
 ├── docs/OPERATIONS.md            deploy, backup, restore, incident procedures
@@ -418,6 +426,35 @@ Organization scoping is a core architectural rule.
 
 # 9. Organization Isolation
 
+Every document now has a non-null `source_id`. `Source` owns ingestion origin,
+namespace/external identity, URI, actor and sync timestamps; `Document` retains
+PDF/file metadata and chunks. A composite foreign key enforces matching tenants.
+The upload and worker transactions keep source states current (`PENDING`,
+`PROCESSING`, `SYNCED`, `FAILED`, `DELETING`, `DELETED`). Reindex retains source
+identity and the previous successful sync timestamp until it succeeds again.
+
+`GET /organizations/{id}/sources` supports pagination, `origin`, `sync_state`
+and `include_deleted`; `GET /organizations/{id}/sources/{source_id}` exposes
+one source. Viewers can read these endpoints. Document responses include
+`source_id`. URIs for uploads are relative API paths, never storage paths.
+Deletion retains a source tombstone, not the PDF, chunks or vectors. Future
+claims must treat a deleted source as withdrawn evidence.
+
+Apply migrations through `b25c83e4f916` with API/workers stopped before deploying
+this version. The source migration backfills existing documents without
+re-embedding; legacy
+`last_synced_at` uses the READY document's `updated_at` as a best available
+historical timestamp. Existing source identity is not inferred from filenames.
+
+READY documents queue a generation-bound `knowledge_jobs` pass. Nemotron remains
+the primary embedding provider; the configured answer LLM performs structured
+entity and relationship extraction. Its output is stored as proposals and
+mentions, never queryable facts. A human member must accept an entity proposal
+or resolve it to an existing canonical entity, then accept relationship proposals
+against confirmed endpoints. Reindex and delete remove generation-bound evidence
+and withdraw entities or relationships that no longer have support.
+
+
 Every document and vector belongs to an organization.
 
 The vector payload includes:
@@ -480,6 +517,7 @@ Run it with:
 
 ```bash
 python -m app.worker          # or --once, for a single job
+python -m app.knowledge_worker # second-pass proposals; run as a separate process
 ```
 
 Nothing is indexed without it. Several can run at once; the row lock is what
@@ -945,6 +983,7 @@ Important entities currently include:
 Organization
 OrganizationApiKey
 OrganizationRateLimit
+Source
 Document
 DocumentChunk
 IngestionJob
@@ -1349,7 +1388,7 @@ green.
 Before submitting a major backend change, verify:
 
 ```text
-1. Application starts, and so does the worker.
+1. Application starts, and so do both workers.
 2. Organization can be created.
 3. PDF upload answers 202 with a Location header.
 4. Polling that Location reaches READY.
@@ -1361,6 +1400,9 @@ Before submitting a major backend change, verify:
 10. Delete leaves nothing in Postgres, on disk, or in Qdrant.
 11. Reindex leaves no vectors from the previous generation.
 12. A failed document reports a specific error code, not "processing failed".
+13. Extracted claims remain proposals until a human accepts or resolves them.
+14. A two-hop question can join reviewed facts from two sources and cite both.
+15. Reindex/delete withdraws facts that lose their last supporting chunk.
 ```
 
 A change that breaks any of these should be treated as a regression unless intentionally changing the architecture.
@@ -1698,7 +1740,7 @@ Migration/upgrade notes
 
 # 43. Current Milestone
 
-As of the end of Phase 3:
+As of the end of Phase 4:
 
 ```text
 Document ingestion:         WORKING, durable, off the request path
@@ -1724,7 +1766,7 @@ Health, readiness, metrics: WORKING
 Container and compose:      WORKING
 Backup and restore:         WORKING, rehearsed in CI
 Auth:                       SESSIONS AND ROLE-SCOPED API KEYS
-Knowledge model:            NOT YET (Phase 4)
+Knowledge model:            WORKING, REVIEWED AND PROVENANCE-AWARE
 Connectors:                 NOT YET (Phase 5)
 Frontend:                   NOT YET (Phase 6)
 ```
@@ -1735,18 +1777,9 @@ This is a hardened backend, not a finished product.
 
 # 44. Immediate Priorities
 
-`docs/ROADMAP.md` is the ordered list. The next phase is **Phase 4 — the
-knowledge model**, and inside it:
-
-1. A `Source` abstraction above `Document`, so a Slack thread and a PDF are
-   both sources. Everything else in Phase 4, and every Phase 5 connector,
-   sits on it; introducing it after entities exist means rewriting them.
-2. The entity layer: people, projects, decisions, systems.
-3. The relationship layer connecting those entities.
-4. An extraction pipeline that populates both from sources, with confidence
-   and provenance.
-5. Entity-aware retrieval, measured against the existing eval harness rather
-   than assumed to be better.
+`docs/ROADMAP.md` is the ordered list. The next phase is **Phase 5 — connectors**.
+Start with one connector and carry source identity, incremental sync, deletion,
+permissions and rate-limit recovery through to completion before adding another.
 
 ## Current hardening checklist
 
@@ -1759,7 +1792,7 @@ knowledge model**, and inside it:
 - [x] Retrieval evaluation harness and a question set
 - [x] Users, roles, audit log, and the full credential test matrix
 - [x] Container image, readiness probes, metrics, rehearsed restore
-- [ ] Sources, entities and relationships
+- [x] Sources, entities and temporal relationships with human review
 - [ ] Object storage, product UI, and connectors
 
 An API key is readable only at the moment it is issued. Store it in a secret

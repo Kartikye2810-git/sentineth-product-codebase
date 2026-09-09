@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.audit import record
 from app.clock import utcnow
 from app.db.database import get_db
-from app.db.models import AuditEvent, IngestionJob, UsageRecord
+from app.db.models import AuditEvent, IngestionJob, KnowledgeJob, UsageRecord
 from app.logging_config import request_id_var
 from app.settings import get_settings
 
@@ -34,6 +34,9 @@ retrieval = Counter(
     "sentineth_retrieval_requests", "Retrieval hit rate", ["operation", "hit"], registry=registry
 )
 jobs = Gauge("sentineth_jobs", "Durable jobs by state", ["state"], registry=registry)
+knowledge_jobs = Gauge(
+    "sentineth_knowledge_jobs", "Knowledge extraction jobs by state", ["state"], registry=registry
+)
 processed = Gauge(
     "sentineth_document_events",
     "Durable cumulative document outcomes",
@@ -62,11 +65,15 @@ def capture_usage(response, model):
     )
 
 
-def finish_query(db, organization_id, operation, hits, usage, failed=False):
+def save_usage(db, organization_id, usage):
     for item in usage:
         db.add(
             UsageRecord(organization_id=organization_id, request_id=request_id_var.get(), **item)
         )
+
+
+def finish_query(db, organization_id, operation, hits, usage, failed=False):
+    save_usage(db, organization_id, usage)
     record(db, operation + (".failed" if failed else ".completed"), organization_id, hits=hits)
     db.commit()
     if not failed:
@@ -90,6 +97,11 @@ def metrics(db: Session = Depends(get_db), _: None = Depends(metrics_auth)):
     )
     for state in ("QUEUED", "PROCESSING", "SUCCEEDED", "FAILED"):
         jobs.labels(state).set(counts.get(state, 0))
+    knowledge_counts = dict(
+        db.execute(select(KnowledgeJob.status, func.count()).group_by(KnowledgeJob.status)).all()
+    )
+    for state in ("QUEUED", "PROCESSING", "SUCCEEDED", "FAILED"):
+        knowledge_jobs.labels(state).set(knowledge_counts.get(state, 0))
     counts = dict(
         db.execute(
             select(AuditEvent.action, func.count())

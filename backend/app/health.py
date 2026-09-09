@@ -16,7 +16,7 @@ from app.settings import get_settings
 
 
 router = APIRouter(tags=["Operations"])
-SCHEMA_REVISION = "f93a61c2d704"
+SCHEMA_REVISION = "b25c83e4f916"
 
 
 def database_ready(db):

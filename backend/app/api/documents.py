@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.database import get_db
-from app.db.models import Document
+from app.db.models import Document, Source
 from app.dependencies import (
     get_embedding_provider,
     get_llm_provider,
@@ -39,6 +39,7 @@ from app.services.document_service import (
     queue_document,
     queue_existing,
 )
+from app.services.knowledge_service import retrieve_graph
 from app.services.query_service import answer_query
 from app.services.retrieval_service import retrieve
 from app.settings import get_settings
@@ -48,18 +49,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/organizations", tags=["Documents"], dependencies=[Depends(require_organization_access)])
 
 
-def query_admission(organization_id: UUID, db: Session = Depends(get_db)) -> list[str]:
+def query_admission(organization_id: UUID, db: Session = Depends(get_db)) -> None:
     try:
         lock_organization(db, organization_id)
         consume_rate(db, organization_id, "query", get_settings().queries_per_minute)
         db.commit()
-        # SQL is the authority on visibility. Failed/queued/deleting or orphaned
-        # vectors must never enter the answer context.
-        return [str(value) for value in db.scalars(select(Document.id).where(
-            Document.organization_id == organization_id, Document.status == "READY"))]
     except Exception:
         db.rollback()
         raise
+
+
+def ready_documents(db: Session, organization_id: UUID, payload: SearchRequest) -> list[str]:
+    # SQL is the authority on visibility and metadata. Vector payloads alone
+    # never decide which sources a caller can search.
+    statement = select(Document.id).join(Source, Source.id == Document.source_id).where(
+        Document.organization_id == organization_id, Document.status == "READY",
+        Source.deleted_at.is_(None))
+    if payload.source_origins is not None:
+        statement = statement.where(Source.origin.in_(payload.source_origins))
+    if payload.created_after is not None:
+        statement = statement.where(Source.created_at >= payload.created_after)
+    if payload.created_before is not None:
+        statement = statement.where(Source.created_at < payload.created_before)
+    return [str(value) for value in db.scalars(statement)]
 
 
 @router.get("/{organization_id}/documents", response_model=DocumentListResponse)
@@ -109,12 +121,13 @@ def remove_document(organization_id: UUID, document_id: UUID, response: Response
 
 @router.post("/{organization_id}/search", response_model=SearchResponse)
 async def search_documents(organization_id: UUID, payload: SearchRequest,
-    ready: list[str] = Depends(query_admission),
+    _: None = Depends(query_admission),
     embedding: EmbeddingProvider = Depends(get_embedding_provider),
     vectors: VectorStore = Depends(get_vector_store),
     reranker: RerankProvider | None = Depends(get_rerank_provider),
     db: Session = Depends(get_db)):
     try:
+        ready = await asyncio.to_thread(ready_documents, db, organization_id, payload)
         results = await asyncio.wait_for(retrieve(organization_id, payload.query, embedding,
             vectors, payload.limit, reranker, document_ids=ready), get_settings().provider_timeout_seconds)
         await asyncio.to_thread(finish_query, db, organization_id, "search", len(results), [])
@@ -130,7 +143,7 @@ async def search_documents(organization_id: UUID, payload: SearchRequest,
 
 @router.post("/{organization_id}/query", response_model=QueryResponse)
 async def query_documents(organization_id: UUID, payload: QueryRequest,
-    ready: list[str] = Depends(query_admission),
+    _: None = Depends(query_admission),
     embedding: EmbeddingProvider = Depends(get_embedding_provider),
     vectors: VectorStore = Depends(get_vector_store),
     llm: LLMProvider = Depends(get_llm_provider),
@@ -140,8 +153,13 @@ async def query_documents(organization_id: UUID, payload: QueryRequest,
     usage_token = usage_context.set(usage)
     result = None
     try:
+        ready = await asyncio.to_thread(ready_documents, db, organization_id, payload)
+        knowledge = await asyncio.to_thread(retrieve_graph, db, organization_id, payload.query,
+            payload.as_of, source_origins=payload.source_origins,
+            created_after=payload.created_after, created_before=payload.created_before)
         result = await asyncio.wait_for(answer_query(organization_id, payload.query, embedding,
-            vectors, llm, payload.limit, reranker, document_ids=ready), get_settings().provider_timeout_seconds)
+            vectors, llm, payload.limit, reranker, document_ids=ready,
+            knowledge_facts=knowledge), get_settings().provider_timeout_seconds)
         return result
     except DocumentProcessingError:
         raise

@@ -11,10 +11,11 @@ from sqlalchemy.orm import Session
 
 from app.audit import record
 from app.clock import utcnow
-from app.db.models import Document, IngestionJob, Organization, OrganizationRateLimit
+from app.db.models import Document, IngestionJob, Organization, OrganizationRateLimit, Source
 from app.errors import DocumentBusy, QuotaExceeded, UnsupportedMediaType
 from app.logging_config import request_id_var
 from app.providers.storage.base import StorageProvider
+from app.services.source_service import set_sync_state
 from app.settings import get_settings
 
 
@@ -67,7 +68,12 @@ def queue_document(db: Session, organization_id: UUID, file: UploadFile,
         path, byte_count, digest = storage_provider.save_stream(
             str(organization_id), str(document_id), file.filename or "document.pdf", file.file,
             min(settings.max_upload_bytes, settings.max_storage_bytes_per_org - size))
-        document = Document(id=document_id, organization_id=organization_id,
+        source = Source(organization_id=organization_id, origin="upload",
+            external_id=str(document_id), uri=f"/organizations/{organization_id}/documents/{document_id}",
+            created_by_user_id=getattr(db.info.get("actor"), "user_id", None))
+        db.add(source)
+        db.flush()
+        document = Document(id=document_id, organization_id=organization_id, source_id=source.id,
             filename=Path((file.filename or "document.pdf").replace("\\", "/")).name[:255],
             content_type="application/pdf", file_size=byte_count, storage_path=path,
             content_hash=digest, status="QUEUED", index_generation=1,
@@ -76,6 +82,7 @@ def queue_document(db: Session, organization_id: UUID, file: UploadFile,
         db.flush()
         db.add(IngestionJob(document_id=document.id, organization_id=organization_id,
                             request_id=request_id_var.get()))
+        record(db, "source.created", organization_id, source.id, origin="upload", document_id=str(document_id))
         record(db, "document.upload_queued", organization_id, document.id, bytes=byte_count)
         db.commit()  # The document and its job become durable together.
         db.refresh(document)
@@ -130,6 +137,7 @@ def queue_existing(db: Session, organization_id: UUID, document_id: UUID, operat
         job.available_at, job.lease_until, job.error_code = utcnow(), None, None
         document.status = "DELETING" if operation == "DELETE" else "QUEUED"
         document.error_code = document.error_message = None
+        set_sync_state(db, document, "DELETING" if operation == "DELETE" else "PENDING")
         record(db, "document.delete_queued" if operation == "DELETE" else "document.reindex_queued",
                organization_id, document.id)
         db.commit()

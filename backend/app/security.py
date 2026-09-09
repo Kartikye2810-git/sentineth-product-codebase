@@ -134,6 +134,12 @@ require_member = require_organization_role("member")
 require_owner = require_organization_role("owner")
 
 
+def require_human_member(identity: Principal = Depends(require_member)):
+    if not identity.user_id:
+        raise HTTPException(403, "A user member session is required")
+    return identity
+
+
 def require_human_owner(identity: Principal = Depends(require_owner)):
     if not identity.user_id:
         raise HTTPException(403, "A user owner session is required")

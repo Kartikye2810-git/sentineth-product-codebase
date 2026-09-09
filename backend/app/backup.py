@@ -20,6 +20,7 @@ import httpx
 from qdrant_client import QdrantClient
 from sqlalchemy import inspect, select, text, update
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import load_only
 
 from app.audit import record
 from app.clock import utcnow
@@ -220,7 +221,12 @@ def restore(directory, container=None):
             target = storage / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(directory / "documents" / relative, target)
-            document = db.get(Document, UUID(item["document_id"]))
+            # Older backups may predate Source; read only the stable payload columns
+            # until the operator runs migrations after restore.
+            document = db.get(
+                Document, UUID(item["document_id"]),
+                options=[load_only(Document.id, Document.content_hash, Document.storage_path)],
+            )
             if document.content_hash and document.content_hash != item["sha256"]:
                 raise ValueError("Restored database and source checksum differ")
             document.storage_path = str(target)

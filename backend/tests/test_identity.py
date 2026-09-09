@@ -31,6 +31,8 @@ def role_key(client, root, role):
 def routes(root):
     missing = str(uuid4())
     return [
+        ("GET", "/sources", {}),
+        ("GET", f"/sources/{missing}", {}),
         ("GET", "/documents", {}),
         ("GET", f"/documents/{missing}", {}),
         (
@@ -124,7 +126,7 @@ def test_scoped_keys_cannot_administer_or_escalate(client, role):
     for method, path, kwargs in routes(root):
         if (
             path == "/api-keys/rotate"
-            or path.startswith("/documents")
+            or path.startswith(("/documents", "/sources"))
             or path in {"/search", "/query"}
         ):
             continue

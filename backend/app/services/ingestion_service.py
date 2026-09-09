@@ -135,6 +135,7 @@ async def ingest_document(
             payloads.append(
                 {
                     "organization_id": organization_id,
+                    "source_id": str(document.source_id),
                     "document_id": str(document.id),
                     "chunk_id": str(chunk.id),
                     "chunk_index": chunk.chunk_index,

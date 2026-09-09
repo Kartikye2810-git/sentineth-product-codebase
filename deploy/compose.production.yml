@@ -25,6 +25,11 @@ services:
     command: [python, -m, app.worker]
     healthcheck:
       disable: true
+  knowledge-worker:
+    <<: *app
+    command: [python, -m, app.knowledge_worker]
+    healthcheck:
+      disable: true
 
 secrets:
   DATABASE_URL:
