@@ -7,11 +7,14 @@ citations back to the source file.
 Every document, vector and answer is scoped to an organization. One tenant
 cannot read another tenant's data.
 
-Status: pre-alpha. The RAG pipeline works end to end, ingestion runs in a
-separate worker process, and uploads, queries and per-organization storage are
-all bounded. Every document route requires an organization API key, but anyone
-who can reach the service can still create an organization, unauthenticated and
-unthrottled, so do not expose this to the internet yet.
+Status: pre-alpha, but deployable. The RAG pipeline works end to end, ingestion
+runs in a separate worker process, and uploads, queries and per-organization
+storage are all bounded. Requests now come from someone: people sign in and hold
+a revocable session, machines hold a role-scoped API key, every route checks
+membership, and who did what to which document is written to an append-only
+audit log. There is a container image, a readiness check that actually asks
+Postgres and Qdrant, metrics, and a rehearsed restore procedure. There is still
+no frontend, and PDF is the only accepted file type.
 
 ## How it works
 
@@ -62,6 +65,8 @@ to it must follow.
 | Ingestion  | Postgres-backed job queue, worker process      |
 | LLM        | OpenRouter (OpenAI-compatible API)            |
 | Extraction | pypdf                                         |
+| Identity   | Argon2id passwords, opaque bearer sessions, role-scoped API keys |
+| Operations | Docker image, Prometheus metrics, Sentry, pg_dump backups |
 
 ## Prerequisites
 
@@ -179,9 +184,25 @@ alembic upgrade head
 ```
 
 This creates `organizations`, `organization_api_keys`, `documents`,
-`document_chunks`, `ingestion_jobs` and `organization_rate_limits`.
+`document_chunks`, `ingestion_jobs`, `organization_rate_limits`, `users`,
+`memberships`, `user_sessions`, `invitations`, `auth_throttles`,
+`audit_events` and `usage_records`.
 
-### 5. Start the API
+### 5. Create the first account
+
+There is no public sign-up. The first account is made by whoever runs the
+service, from `backend/`:
+
+```bash
+python -m app.admin create-user --email you@example.com
+```
+
+The password is prompted, never passed as an argument, because arguments end up
+in shell history and in `ps`. Everyone after the first is added by an
+invitation from an owner. `python -m app.admin reset-password --email ...`
+recovers a locked-out account and revokes that account's sessions.
+
+### 6. Start the API
 
 ```bash
 python -m uvicorn app.main:app --reload
@@ -189,7 +210,7 @@ python -m uvicorn app.main:app --reload
 
 Interactive docs: http://127.0.0.1:8000/docs
 
-### 6. Start the worker
+### 7. Start the worker
 
 In a second terminal, from `backend/`:
 
@@ -210,15 +231,29 @@ because providers are cached for the lifetime of the process in
 
 ## Try it end to end
 
-Create an organization:
+Sign in with the account you just created:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/organizations -H "Content-Type: application/json" -d "{\"name\": \"Acme Inc\"}"
+curl -X POST http://127.0.0.1:8000/auth/login -H "Content-Type: application/json" -d "{\"email\": \"you@example.com\", \"password\": \"your-password\"}"
 ```
 
-Copy the `id` and the `api_key` from the response. Everything below uses
-them as `ORG_ID` and `ORG_KEY`; without the key every route below answers
-401.
+The `access_token` is a session, good for 12 hours and revocable at any time
+with `POST /auth/logout`. Everything below calls it `SESSION`.
+
+Create an organization. This is the one route that needs a signed-in person
+rather than a key - a key belongs to an organization, so it cannot be what
+brings one into existence:
+
+```bash
+curl -X POST http://127.0.0.1:8000/organizations \
+  -H "Authorization: Bearer SESSION" -H "Content-Type: application/json" -d "{\"name\": \"Acme Inc\"}"
+```
+
+You become its owner. Copy the `id` and the `api_key` from the response;
+everything below uses them as `ORG_ID` and `ORG_KEY`. That key is the only
+time a token is ever readable, and either credential works on the routes
+below - the session because you are an owner of that organization, the key
+because it was issued to it.
 
 Upload a PDF:
 
@@ -261,29 +296,85 @@ curl -X POST http://127.0.0.1:8000/organizations/ORG_ID/search \
   -H "Authorization: Bearer ORG_KEY" -H "Content-Type: application/json" -d "{\"query\": \"revenue target\", \"limit\": 5}"
 ```
 
+Then see who did it:
+
+```bash
+curl http://127.0.0.1:8000/organizations/ORG_ID/audit-events \
+  -H "Authorization: Bearer SESSION"
+```
+
+## Accounts, roles and keys
+
+Two kinds of caller, one authorization check. A **session** identifies a
+person and carries their membership role for the organization in the URL. An
+**API key** identifies an integration and carries the role it was issued with.
+`require_organization_role` compares whichever one presented itself against
+what the route needs, so a viewer key and a viewer person are refused in the
+same place, for the same reason.
+
+| Role   | Can                                                                 |
+| ------ | ------------------------------------------------------------------- |
+| viewer | read documents, search, query                                       |
+| member | everything a viewer can, plus upload, reindex and delete            |
+| owner  | everything a member can, plus keys, audit history and usage         |
+
+Membership itself - inviting, changing a role, removing someone - needs an
+owner who is a person, not a key. An integration that leaks should not be able
+to add an owner to the organization it leaked from.
+
+Adding someone: an owner posts to `/organizations/{org_id}/invitations` with an
+email and a role and gets back a single-use token, valid 48 hours. The invitee
+posts it to `/auth/accept-invitation` with the password they want. There is no
+email delivery yet, so the token has to be handed over some other way.
+Demoting or removing an owner revokes the invitations they issued, and an
+organization will not let its last human owner go.
+
 ## API reference
 
-| Method | Path                                             | Purpose                                 |
-| ------ | ------------------------------------------------ | --------------------------------------- |
-| GET    | `/`                                              | Service name and version                |
-| GET    | `/health`                                        | Liveness check                          |
-| POST   | `/organizations`                                 | Create an organization, returns its key |
-| GET    | `/organizations/{org_id}/api-keys`               | Key metadata, never the token itself    |
-| POST   | `/organizations/{org_id}/api-keys/rotate`        | Issue a replacement, revoke the old key |
-| DELETE | `/organizations/{org_id}/api-keys/{key_id}`      | Revoke one key                          |
-| GET    | `/organizations/{org_id}/documents`              | List documents, paginated               |
-| GET    | `/organizations/{org_id}/documents/{doc_id}`     | Document status, for polling after 202  |
-| POST   | `/organizations/{org_id}/documents`              | Upload a PDF (multipart), 202 + queue   |
-| DELETE | `/organizations/{org_id}/documents/{doc_id}`     | Queue deletion of row, file and vectors, 202 |
-| POST   | `/organizations/{org_id}/documents/{doc_id}/reindex` | Queue a re-chunk and re-embed, 202 |
-| POST   | `/organizations/{org_id}/search`                 | Vector search, returns matching chunks  |
-| POST   | `/organizations/{org_id}/query`                  | Retrieval-augmented answer + citations  |
+| Method | Path                                             | Needs        | Purpose                             |
+| ------ | ------------------------------------------------ | ------------ | ----------------------------------- |
+| GET    | `/`                                              | -            | Service name and version            |
+| GET    | `/live`                                          | -            | Liveness: the process is up         |
+| GET    | `/ready`, `/health`                              | -            | Readiness: Postgres, Qdrant, storage |
+| GET    | `/metrics`                                       | metrics token | Prometheus exposition              |
+| POST   | `/auth/login`                                    | -            | Exchange a password for a session   |
+| POST   | `/auth/accept-invitation`                        | -            | Join an organization, get a session |
+| GET    | `/auth/me`                                       | session      | The signed-in account               |
+| POST   | `/auth/logout`                                   | session      | Revoke this session                 |
+| POST   | `/auth/change-password`                          | session      | Rotate the password, revoke sessions |
+| POST   | `/organizations`                                 | session      | Create an organization, returns its key |
+| GET    | `/organizations`                                 | session      | Organizations you are a member of   |
+| GET    | `/organizations/{org_id}/members`                | human owner  | Who is in it, and as what           |
+| PATCH  | `/organizations/{org_id}/members/{user_id}`      | human owner  | Change a role                       |
+| DELETE | `/organizations/{org_id}/members/{user_id}`      | human owner  | Remove a member                     |
+| GET    | `/organizations/{org_id}/invitations`            | human owner  | Pending and past invitations        |
+| POST   | `/organizations/{org_id}/invitations`            | human owner  | Invite an email at a role           |
+| DELETE | `/organizations/{org_id}/invitations/{inv_id}`   | human owner  | Revoke an invitation                |
+| GET    | `/organizations/{org_id}/api-keys`               | owner        | Key metadata, never the token itself |
+| POST   | `/organizations/{org_id}/api-keys`               | owner        | Issue a key at a role               |
+| POST   | `/organizations/{org_id}/api-keys/rotate`        | the key      | Issue a replacement, revoke the old key |
+| DELETE | `/organizations/{org_id}/api-keys/{key_id}`      | owner        | Revoke one key                      |
+| GET    | `/organizations/{org_id}/audit-events`           | owner        | Who did what, when, paginated       |
+| GET    | `/organizations/{org_id}/usage`                  | owner        | LLM tokens and cost, by model       |
+| GET    | `/organizations/{org_id}/documents`              | viewer       | List documents, paginated           |
+| GET    | `/organizations/{org_id}/documents/{doc_id}`     | viewer       | Document status, for polling after 202 |
+| POST   | `/organizations/{org_id}/documents`              | member       | Upload a PDF (multipart), 202 + queue |
+| DELETE | `/organizations/{org_id}/documents/{doc_id}`     | member       | Queue deletion of row, file and vectors, 202 |
+| POST   | `/organizations/{org_id}/documents/{doc_id}/reindex` | member   | Queue a re-chunk and re-embed, 202  |
+| POST   | `/organizations/{org_id}/search`                 | viewer       | Vector search, returns matching chunks |
+| POST   | `/organizations/{org_id}/query`                  | viewer       | Retrieval-augmented answer + citations |
 
 Every route under `/organizations/{org_id}` requires
-`Authorization: Bearer <key>` for that organization; a key belonging to
-another organization is rejected with 403. `POST /organizations` is the one
-exception, and returns the first key in `api_key` — the only time a token is
-ever readable. Only its SHA-256 hash is stored.
+`Authorization: Bearer <credential>` and membership of that organization; a
+credential belonging to another organization is rejected with 403, and one
+with too low a role is rejected with 403 as well. `POST /organizations`
+returns the first key in `api_key` — the only time a token is ever readable.
+Only its SHA-256 hash is stored, and passwords are hashed separately with
+Argon2id.
+
+Rotation is done by the key being rotated, authenticating as itself. It keeps
+the role and cannot extend its own expiry, so a leaked key cannot rotate itself
+into a longer-lived or more powerful one; an owner issues a new key for that.
 
 Failed requests answer with `{"detail": {"error_code": ..., "message": ...}}`.
 The code is stable and says which failure it was, because "processing failed"
@@ -302,6 +393,12 @@ for all of them is not something a caller can act on:
 A `FAILED` document carries the same code on the status route, so the reason
 survives the request that caused it.
 
+Authentication failures are separate and answer `{"detail": "..."}`: 401 when
+no usable bearer credential was presented, 403 when the credential is real but
+revoked, expired, from another organization, or below the role the route needs.
+Repeated login, invitation and password-change attempts are throttled per
+account and per source address, and answer 429 with `Retry-After`.
+
 `search` and `query` both accept `{"query": str, "limit": int}`, where `limit`
 is 1 to 20 and defaults to 5. `query` caps the question at 2000 characters.
 
@@ -313,16 +410,24 @@ From `backend/`:
 python -m pytest
 ```
 
-82 tests, well under a second, no Docker and no network required. They run
-against SQLite in memory with in-memory embedding, vector and LLM providers,
-but real PDF parsing, real chunking and real on-disk storage.
+104 tests, a few seconds, no Docker and no network required. They run against
+SQLite in memory with in-memory embedding, vector and LLM providers, but real
+PDF parsing, real chunking and real on-disk storage.
 
 The suite covers the whole upload-to-answer path, organization isolation, chunk
 overlap, the source-citation regression that made `sources[].filename` always
 null, the API-key lifecycle, the structured log line every request emits, and
 the durable-job properties: retry after a crash, a reindex leaving no stale
-vectors behind, a delete leaving nothing in Postgres, on disk or in Qdrant, and
-every document route rejecting a key from another organization.
+vectors behind, and a delete leaving nothing in Postgres, on disk or in Qdrant.
+
+Every test authenticates for real. There is no `dependency_overrides` entry
+switching authorization off, because the one place a bug there would matter is
+the one place it would then be invisible. `tests/test_identity.py` walks every
+tenant route with nine credential states - absent, wrong scheme, malformed,
+expired key, revoked key, key from another organization, expired session,
+revoked session, session with no membership - and asserts each is refused,
+then checks that a viewer credential cannot write and a member credential
+cannot administer.
 
 Two further tests need a real Postgres, because SQLite cannot prove row
 locking or `SKIP LOCKED`. They skip unless you point them at one:
@@ -369,16 +474,83 @@ which ones are not yet trustworthy.
 | `RERANK`               | no       | `false`                         | Loads a cross-encoder, costs latency per query |
 | `SQL_ECHO`             | no       | `false`                         | Set `true` to log every SQL statement        |
 
-Resource limits are separate, all prefixed `SENTINETH_` and validated at
-startup in `app/settings.py`: `MAX_UPLOAD_BYTES` (25 MiB),
+Everything else is prefixed `SENTINETH_`, and all of it lands in one validated
+`Settings` object in `app/settings.py` rather than in `os.getenv` calls spread
+across the code. A bad value fails at startup, not at the first request that
+happened to need it.
+
+| Variable                              | Default        | Notes                                       |
+| ------------------------------------- | -------------- | ------------------------------------------- |
+| `SENTINETH_ENVIRONMENT`               | `development`  | `production` turns on the strict checks below |
+| `SENTINETH_METRICS_TOKEN`             | none           | Bearer token for `/metrics`; required in production |
+| `SENTINETH_SENTRY_DSN`                | none           | Error tracking off when empty               |
+| `SENTINETH_ALLOWED_HOSTS`             | localhost      | JSON list; `*` is refused in production     |
+| `SENTINETH_ALLOWED_ORIGINS`           | empty          | JSON list, for CORS                         |
+| `SENTINETH_STORAGE_DIR`               | `backend/storage/documents` | Where uploaded files live      |
+| `SENTINETH_SECRETS_DIR`               | none           | Directory of secret files, one per variable |
+| `SENTINETH_SESSION_HOURS`             | 12             | Session lifetime                            |
+| `SENTINETH_INVITATION_HOURS`          | 48             | Invitation lifetime                         |
+| `SENTINETH_AUTH_ATTEMPTS_PER_MINUTE`  | 10             | Per account                                 |
+| `SENTINETH_AUTH_IP_ATTEMPTS_PER_MINUTE` | 60           | Per source address                          |
+| `SENTINETH_MAX_ORGANIZATIONS_PER_USER` | 5             | Organizations one account can own           |
+
+Resource limits use the same prefix: `MAX_UPLOAD_BYTES` (25 MiB),
 `MAX_DOCUMENTS_PER_ORG` (1000), `MAX_STORAGE_BYTES_PER_ORG` (1 GiB),
 `UPLOADS_PER_MINUTE` (10), `QUERIES_PER_MINUTE` (60),
 `PROVIDER_TIMEOUT_SECONDS` (30), `JOB_MAX_ATTEMPTS` (3),
 `JOB_LEASE_SECONDS` (300). Every one has a default that works; set them when
 a tenant needs a different one, not to get started.
 
+With `SENTINETH_ENVIRONMENT=production` the service additionally refuses to
+start on SQLite, on a metrics token under 32 characters, on `*` in the allowed
+hosts or origins, on a plain-HTTP provider URL, on `LOG_LEVEL=DEBUG`, and on
+`SQL_ECHO`. Each of those is a thing that is fine locally and a hole in
+production, so the check is the environment, not the reviewer.
+
 Leave `SQL_ECHO` off unless you are debugging: it logs document content into
 your terminal and slows requests down.
+
+## Running it as a service
+
+`Dockerfile` builds one image that runs either process - `uvicorn app.main:app`
+for the API, `python -m app.worker` for the worker - as a non-root user, with a
+`HEALTHCHECK` that hits `/ready`. The default build installs no local model
+weights, because the default embedding provider is hosted; `--build-arg
+WITH_LOCAL_MODELS=true` adds torch and MiniLM for offline use.
+
+```bash
+docker compose -f docker-compose.yml -f compose.app.yml up -d --build
+```
+
+`deploy/compose.production.yml` is the same image with the settings a real
+deployment needs: secrets read from files rather than the environment, a
+read-only root filesystem, dropped capabilities, and the API bound to
+localhost for a reverse proxy to terminate TLS in front of.
+
+`/live` says the process is up. `/ready` asks Postgres for its schema
+revision, asks Qdrant about the collection's dimension and hybrid config, and
+checks the storage directory is writable - it answers 503 when any of those is
+wrong, which is what a load balancer should act on. `/metrics` exposes request
+counts and latency, retrieval hit rate, job states and queue age; per-organization
+LLM cost is on `/organizations/{org_id}/usage` instead, where it is scoped to a
+tenant rather than to the process.
+
+## Backups and restore
+
+`python -m app.backup backup DIR --quiesced` takes a `pg_dump`, copies every
+document's source file, checksums each one against `documents.content_hash`,
+and writes a manifest. `verify` re-checks a backup without touching anything;
+`restore` refuses to run into a database or storage directory that is not
+empty, and revokes every session, key and invitation on the way in, because a
+restored backup is a snapshot of credentials someone may have rotated since.
+
+Qdrant is not in that path by default, on purpose: vectors are derived from
+Postgres and the source files, so the recovery procedure rebuilds them with
+`scripts/reindex.py` rather than restoring them. `scripts/rehearse_restore.py`
+runs that whole procedure against disposable databases and collections, and CI
+runs it on every push, so the restore path is exercised continuously rather
+than first attempted during an incident. `docs/OPERATIONS.md` is the written
+procedure.
 
 ## Layout
 
@@ -386,23 +558,38 @@ your terminal and slows requests down.
 sentineth/
   info.md                    architecture, conventions, and rules for changes
   docker-compose.yml         Postgres + Qdrant
+  compose.app.yml            API and worker on top of those
+  Dockerfile                 one image, two commands
+  deploy/                    production compose file and env template
   .env.example               template for .env
   docs/ROADMAP.md            what gets built next, in order
+  docs/OPERATIONS.md         deploy, backup, restore, incident procedures
   backend/
     alembic/                 migrations
     app/
-      main.py                app, health, organizations
+      main.py                app wiring, middleware, routers
       worker.py              claims and runs ingestion jobs
-      settings.py            validated resource limits
+      settings.py            validated settings and resource limits
+      security.py            authentication and role checks
+      audit.py               append-only audit trail
+      health.py              /live, /ready
+      observability.py       metrics, usage recording
+      admin.py               operator CLI: users, owners, passwords
+      backup.py              backup, verify, restore
+      relocate_storage.py    move the storage directory safely
       body_limit.py          ASGI request body cap
       dependencies.py        cached provider factories
       schemas.py             request/response models
+      identity_schemas.py    auth, membership, audit models
+      api/auth.py            signup, login, logout, invitations
+      api/organizations.py   organizations, members, keys, audit, usage
       api/documents.py       upload, status, list, delete, reindex, search, query
       services/              document, chunking, retrieval, query
       providers/             embeddings, llm, vector, storage adapters
       db/                    engine, session, models
     eval/                    retrieval question set and harness
     scripts/reindex.py       rebuild vectors into a new collection
+    scripts/rehearse_restore.py  end-to-end recovery drill, run in CI
     tests/                   pytest suite
     storage/documents/       uploaded files (gitignored)
 ```
@@ -463,11 +650,10 @@ real API differences. Bump both together.
 
 What gets built next, and in what order, is in `docs/ROADMAP.md`.
 
-- User accounts, roles and permissions. A key authenticates an organization,
-  not a person, so there is no way to say who did what or to give one user
-  less access than another.
-- Anything in front of `POST /organizations`. Organization creation is
-  unauthenticated and unthrottled, which is the top blocker before any
-  deployment.
 - Frontend. There is none.
 - File types other than PDF. Other uploads are rejected with a 415.
+- Email delivery. Invitations return a token in the API response; sending it
+  to the invited person is currently your job.
+- Password reset by the account holder. An operator resets passwords with
+  `python -m app.admin reset-password`; there is no self-service flow.
+- Cross-organization search. A query answers from one tenant's documents.

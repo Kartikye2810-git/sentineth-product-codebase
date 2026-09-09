@@ -9,9 +9,11 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from app.audit import record
 from app.clock import utcnow
 from app.db.models import Document, IngestionJob, Organization, OrganizationRateLimit
 from app.errors import DocumentBusy, QuotaExceeded, UnsupportedMediaType
+from app.logging_config import request_id_var
 from app.providers.storage.base import StorageProvider
 from app.settings import get_settings
 
@@ -68,10 +70,13 @@ def queue_document(db: Session, organization_id: UUID, file: UploadFile,
         document = Document(id=document_id, organization_id=organization_id,
             filename=Path((file.filename or "document.pdf").replace("\\", "/")).name[:255],
             content_type="application/pdf", file_size=byte_count, storage_path=path,
-            content_hash=digest, status="QUEUED", index_generation=1)
+            content_hash=digest, status="QUEUED", index_generation=1,
+            created_by_user_id=getattr(db.info.get("actor"), "user_id", None))
         db.add(document)
         db.flush()
-        db.add(IngestionJob(document_id=document.id, organization_id=organization_id))
+        db.add(IngestionJob(document_id=document.id, organization_id=organization_id,
+                            request_id=request_id_var.get()))
+        record(db, "document.upload_queued", organization_id, document.id, bytes=byte_count)
         db.commit()  # The document and its job become durable together.
         db.refresh(document)
         return document
@@ -120,10 +125,13 @@ def queue_existing(db: Session, organization_id: UUID, document_id: UUID, operat
         if job is None:
             job = IngestionJob(document_id=document.id, organization_id=organization_id)
             db.add(job)
+        job.request_id = request_id_var.get()
         job.operation, job.status, job.attempts = operation, "QUEUED", 0
         job.available_at, job.lease_until, job.error_code = utcnow(), None, None
         document.status = "DELETING" if operation == "DELETE" else "QUEUED"
         document.error_code = document.error_message = None
+        record(db, "document.delete_queued" if operation == "DELETE" else "document.reindex_queued",
+               organization_id, document.id)
         db.commit()
         db.refresh(document)
         return document

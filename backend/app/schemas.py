@@ -26,6 +26,8 @@ class ApiKeyResponse(BaseModel):
     expires_at: datetime | None = None
     revoked_at: datetime | None = None
     active: bool
+    role: str
+    label: str
 
     model_config = ConfigDict(from_attributes=True)
 

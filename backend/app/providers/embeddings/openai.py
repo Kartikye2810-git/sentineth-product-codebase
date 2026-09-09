@@ -1,9 +1,9 @@
-import os
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from app.providers.embeddings.base import EmbeddingProvider, InputType
+from app.settings import get_settings
 
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):
@@ -15,7 +15,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         organization: str | None = None,
         **kwargs: Any,
     ) -> None:
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or get_settings().openai_api_key.get_secret_value()
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY is required to use OpenAIEmbeddingProvider.")
 

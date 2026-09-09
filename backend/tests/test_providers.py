@@ -19,6 +19,7 @@ from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.embeddings.openai import OpenAIEmbeddingProvider
 from app.providers.llm.base import LLMProvider
 from app.providers.llm.openai import OpenAIProvider
+from app.settings import get_settings
 
 
 def test_the_openai_providers_satisfy_the_interfaces():
@@ -56,14 +57,17 @@ def test_the_default_embedding_configuration_is_nemotron(monkeypatch):
     assert active_embedding_provider() == "nvidia"
     assert active_collection_name() == "sentineth_documents_nemotron"
 
+    get_settings.cache_clear()
     monkeypatch.setenv("EMBEDDING_PROVIDER", "  NVIDIA  ")
     assert active_embedding_provider() == "nvidia"
     assert active_collection_name() == "sentineth_documents_nemotron"
 
+    get_settings.cache_clear()
     monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
     assert active_collection_name() == "sentineth_documents"
 
     # An explicit collection wins, because that is how a reindex is cut over.
+    get_settings.cache_clear()
     monkeypatch.setenv("QDRANT_COLLECTION", "rebuild_2026_09")
     assert active_collection_name() == "rebuild_2026_09"
 

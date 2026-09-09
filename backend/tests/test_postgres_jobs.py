@@ -103,7 +103,23 @@ def test_api_queries_remain_responsive_during_worker_ingestion(postgres, tmp_pat
         get_vector_store:lambda:vectors,get_storage_provider:lambda:storage,get_llm_provider:lambda:FakeLLMProvider()})
     try:
         with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
-            org=client.post('/organizations',json={'name':'Concurrent test'}).json()
+            from app.api.auth import issue_session
+            from app.db.models import User
+            from app.security import hash_password
+            with postgres() as db:
+                user = User(
+                    email="concurrency@example.com",
+                    password_hash=hash_password("concurrency-password"),
+                )
+                db.add(user)
+                db.flush()
+                token = issue_session(db, user).access_token
+                db.commit()
+            org = client.post(
+                "/organizations",
+                json={"name": "Concurrent test"},
+                headers={"Authorization": "Bearer " + token},
+            ).json()
             headers={'Authorization':'Bearer '+org['api_key']}
             root=f"/organizations/{org['id']}"
             def upload():
@@ -126,7 +142,7 @@ def test_api_queries_remain_responsive_during_worker_ingestion(postgres, tmp_pat
             future=pool.submit(lambda:asyncio.run(run_once(postgres,provider,vectors,storage)))
             assert entered.wait(timeout=5)
             try:
-                assert client.get('/health').status_code==200
+                assert client.get("/live").status_code == 200
                 assert client.get(queued.headers['Location'],headers=headers).json()['status']=='PROCESSING'
                 assert client.delete(queued.headers['Location'],headers=headers).status_code==409
                 measured=[search_latency() for _ in range(10)]

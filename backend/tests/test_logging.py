@@ -69,7 +69,7 @@ def test_exceptions_are_logged_with_their_traceback(log_stream):
 def test_a_request_logs_one_line_tagged_with_the_returned_request_id(
     client, log_stream
 ):
-    response = client.get("/health")
+    response = client.get("/live")
 
     assert response.status_code == 200
 
@@ -80,13 +80,13 @@ def test_a_request_logs_one_line_tagged_with_the_returned_request_id(
     assert len(completed) == 1
     assert completed[0]["request_id"] == response.headers["X-Request-ID"]
     assert completed[0]["method"] == "GET"
-    assert completed[0]["path"] == "/health"
+    assert completed[0]["path"] == "/live"
     assert completed[0]["status_code"] == 200
     assert completed[0]["duration_ms"] >= 0
 
 
 def test_an_inbound_request_id_is_reused_rather_than_replaced(client, log_stream):
-    response = client.get("/health", headers={"X-Request-ID": "trace-me"})
+    response = client.get("/live", headers={"X-Request-ID": "trace-me"})
 
     assert response.headers["X-Request-ID"] == "trace-me"
 
@@ -115,6 +115,6 @@ def test_a_rejected_upload_logs_its_code_and_request_id(
 
 
 def test_the_request_id_contextvar_is_cleared_between_requests(client, log_stream):
-    client.get("/health")
+    client.get("/live")
 
     assert request_id_var.get() is None

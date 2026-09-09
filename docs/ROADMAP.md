@@ -4,7 +4,7 @@ The single source of truth for what Sentineth builds next, and in what order.
 `info.md` section 26 and `docs/PROJECT_STATUS_SEPT_2026.md` used to carry
 roadmaps of their own; both now point here.
 
-Phases 0, 1 and 2 are delivered. Phase 3 is next.
+Phases 0 through 3 are delivered. Phase 4 is next.
 
 Phases are sequential. Each one exists because the next phase depends on it,
 and the "Done when" line is the test for moving on — not a feeling of
@@ -132,21 +132,63 @@ and a held lease not being stolen.
 
 ---
 
-## Phase 3 — Real identity, and the ability to operate the service
+## Phase 3 — Real identity, and the ability to operate the service — **delivered**
 
-- **3.1** — Users, memberships and roles, above the current organization
-  API keys.
-- **3.2** — Test the security boundary properly: missing, wrong, revoked and
-  expired credentials against every route, including cross-organization
-  lifecycle actions. Phase 2 took the first slice: every document route,
-  including the new status route, is asserted to reject a valid key belonging
-  to another organization. The rest — revoked, expired, malformed — waits for
-  the user and membership model here.
+- **3.1** — Users, memberships and roles above the organization API keys.
+  `users`, `memberships`, `user_sessions` and `invitations`, with Argon2id
+  password hashing and opaque `sentineth_session_*` bearer tokens stored only
+  as SHA-256 hashes. A session lasts 12 hours and is revocable; an invitation
+  is single-use and lasts 48. API keys carry a role too, so a viewer key and a
+  viewer person meet the same check in `require_organization_role`.
+  `POST /organizations` now requires a signed-in person — a key belongs to an
+  organization, so it cannot be what brings one into existence.
+- **3.2** — Test the security boundary properly.
+  `tests/test_identity.py` runs nine credential states — missing, wrong
+  scheme, malformed, expired, revoked, foreign, and the session equivalents of
+  the last three — against every tenant route the app exposes, enumerated from
+  the route table rather than listed by hand, so a route added later is
+  covered the day it is added. Missing and malformed answer 401; real but
+  unusable answers 403.
 - **3.3** — Append-only audit log of security and data events.
-- **3.4** — Ship an operable service: Dockerfile, health and readiness
-  probes, metrics, configuration validated at startup.
-- **3.5** — Backups, and a restore that has actually been run.
-- **3.6** — Secrets and configuration management.
+  `audit_events` records actor type, actor id, action, resource, request id
+  and organization. Append-only is enforced by a database trigger that rejects
+  `UPDATE`, `DELETE` and `TRUNCATE`, not by convention in the application, and
+  owners read their own organization's history through the API.
+- **3.4** — Ship an operable service. One Dockerfile running the API or the
+  worker as a non-root user; `/live` for the process, `/ready` for Postgres's
+  schema revision, Qdrant's dimension and hybrid config, and a writable
+  storage directory; Prometheus metrics behind a token; every setting
+  validated in `app/settings.py` at startup rather than at first use.
+- **3.5** — Backups, and a restore that has actually been run. `pg_dump` plus
+  the source files, each checksummed against `documents.content_hash`.
+  `scripts/rehearse_restore.py` performs the whole documented recovery against
+  disposable databases and collections, and CI runs it on every push.
+- **3.6** — Secrets and configuration management. Secrets are `SecretStr` and
+  can be read from files rather than the environment; `production` refuses to
+  start on SQLite, a short metrics token, a wildcard host or origin, a
+  plain-HTTP provider URL, debug logging or SQL echo.
+
+**Acceptance criteria, each with a test:**
+
+- *Credentials fail closed.* Every tenant route rejects a credential that is
+  missing, malformed, expired, revoked or from another organization, and does
+  so with the same code for the same reason regardless of route.
+- *Roles are not advisory.* A viewer cannot upload, a member cannot read the
+  audit log or issue keys, and an API key — whatever its role — cannot change
+  membership. Rotation keeps the rotating key's role and cannot extend its own
+  expiry, so a leaked key cannot rotate itself into a stronger one.
+- *An organization keeps a human owner.* Removing or demoting the last human
+  owner is refused, and demoting one revokes the invitations they issued, so
+  access cannot be restored through a door the removed owner left open.
+- *History cannot be edited.* Raw `UPDATE`, `DELETE` and `TRUNCATE` against
+  `audit_events` are rejected by the database.
+- *Readiness means ready.* `/ready` answers 503 when the schema revision is
+  wrong, the collection's dimension disagrees with the embedding provider, or
+  storage is not writable — the states where accepting traffic would corrupt
+  or fail silently.
+- *Restore is rehearsed, not hoped for.* The drill restores into empty state,
+  refuses to restore into non-empty state, rebuilds vectors from Postgres and
+  the files, and revokes every session, key and invitation on the way in.
 
 **Done when:** a design partner can be given a URL and credentials, and you
 can tell them what happened when something goes wrong.

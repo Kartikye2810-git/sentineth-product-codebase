@@ -1,9 +1,10 @@
-import os
 from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.observability import capture_usage
 from app.providers.llm.base import LLMProvider
+from app.settings import get_settings
 
 
 class OpenAIProvider(LLMProvider):
@@ -15,11 +16,11 @@ class OpenAIProvider(LLMProvider):
         organization: str | None = None,
         **kwargs: Any,
     ) -> None:
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or get_settings().openai_api_key.get_secret_value()
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY is required to use OpenAIProvider.")
 
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.model = model or get_settings().openai_model
         self.base_url = base_url
         self.organization = organization
         kwargs.setdefault("timeout", 10.0)
@@ -45,4 +46,5 @@ class OpenAIProvider(LLMProvider):
             **kwargs,
         )
 
+        capture_usage(response, self.model)
         return response.choices[0].message.content or ""

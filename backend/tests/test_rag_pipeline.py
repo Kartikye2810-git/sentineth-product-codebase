@@ -54,7 +54,7 @@ def test_health_and_root():
     from app.main import app
 
     with TestClient(app) as client:
-        assert client.get("/health").json() == {"status": "healthy"}
+        assert client.get("/live").json() == {"status": "alive"}
         assert client.get("/").json()["name"] == "Sentineth AI"
 
 

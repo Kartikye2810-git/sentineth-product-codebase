@@ -15,7 +15,6 @@ from scripts and background jobs, not just from request handlers.
 """
 
 import logging
-import os
 from functools import lru_cache, wraps
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from app.providers.storage.base import StorageProvider
 from app.providers.storage.local import LocalStorageProvider
 from app.providers.vector.base import VectorStore
 from app.providers.vector.qdrant import QdrantVectorStore
+from app.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ COLLECTIONS = {
 
 
 def active_embedding_provider() -> str:
-    return os.getenv("EMBEDDING_PROVIDER", DEFAULT_EMBEDDING_PROVIDER).strip().lower()
+    return get_settings().embedding_provider
 
 
 def active_collection_name() -> str:
@@ -76,9 +76,7 @@ def active_collection_name() -> str:
     EMBEDDING_PROVIDER=NVIDIA pointed the application and the reindex script
     at different collections.
     """
-    return os.getenv("QDRANT_COLLECTION") or COLLECTIONS.get(
-        active_embedding_provider(), COLLECTIONS["local"]
-    )
+    return get_settings().collection_name
 
 
 def configured_provider(factory):
@@ -132,7 +130,7 @@ def get_vector_store() -> VectorStore:
         # Like the dimension, this is fixed when the collection is created
         # and cannot be added later, so changing it is a reindex into a new
         # collection rather than a setting that takes effect on restart.
-        hybrid=os.getenv("QDRANT_HYBRID", "").strip().lower() in {"1", "true", "yes"},
+        hybrid=get_settings().qdrant_hybrid,
     )
 
     logger.info(
@@ -151,7 +149,7 @@ def get_rerank_provider() -> RerankProvider | None:
     # Off unless asked for. It loads a second model into the process and
     # adds a forward pass per candidate to every search, so it should be
     # switched on by someone who has seen it pay for that.
-    if os.getenv("RERANK", "").strip().lower() not in {"1", "true", "yes"}:
+    if not get_settings().rerank:
         return None
 
     provider = LocalRerankProvider()
@@ -163,7 +161,7 @@ def get_rerank_provider() -> RerankProvider | None:
 
 @lru_cache(maxsize=1)
 def get_storage_provider() -> StorageProvider:
-    return LocalStorageProvider(STORAGE_DIR)
+    return LocalStorageProvider(get_settings().storage_dir)
 
 
 @lru_cache(maxsize=1)

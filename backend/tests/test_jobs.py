@@ -149,7 +149,9 @@ def test_all_document_routes_reject_foreign_credentials(api_key_client):
              ('post','/query',{'json':{'query':'test'}}),('post','/search',{'json':{'query':'test'}})]
     for method,path,kwargs in cases:
         assert client.request(method,root+path,headers=foreign,**kwargs).status_code == 403
-        assert client.request(method,root+path,**kwargs).status_code == 401
+        assert client.request(
+            method, root + path, headers={"Authorization": ""}, **kwargs
+        ).status_code == 401
 
 
 def test_provider_timeout_returns_sanitized_503(client, organization, monkeypatch, vector_store):

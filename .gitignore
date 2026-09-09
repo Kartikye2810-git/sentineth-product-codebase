@@ -25,3 +25,8 @@ node_modules/
 # Eval corpus PDFs are rendered from eval/corpus/*.md, never committed.
 backend/eval/corpus_pdf/
 backend/eval-report.json
+
+# Operational secrets and backups
+secrets/
+backups/
+deploy/production.env

@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
+from sqlalchemy import JSON, CheckConstraint, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.clock import utcnow
@@ -81,6 +81,8 @@ class Document(Base):
         default="UPLOADED",
         nullable=False,
     )
+
+    created_by_user_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
     index_generation: Mapped[int] = mapped_column(default=0, nullable=False)
 
@@ -172,12 +174,19 @@ class DocumentChunk(Base):
 
 class OrganizationApiKey(Base):
     __tablename__ = "organization_api_keys"
+    __table_args__ = (
+        CheckConstraint("role IN ('owner','member','viewer')", name="api_key_role"),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id"), nullable=False, index=True
     )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # A key carries a role like a membership does, so an integration can be
+    # given read-only access without a second authentication mechanism.
+    role: Mapped[str] = mapped_column(String(20), default="owner", nullable=False)
+    label: Mapped[str] = mapped_column(String(100), default="API key", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -206,6 +215,7 @@ class IngestionJob(Base):
     organization_id: Mapped[UUID] = mapped_column(
         ForeignKey("organizations.id"), index=True, nullable=False
     )
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     operation: Mapped[str] = mapped_column(String(20), nullable=False, default="INGEST")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="QUEUED")
     attempts: Mapped[int] = mapped_column(default=0, nullable=False)
@@ -221,3 +231,92 @@ class OrganizationRateLimit(Base):
     operation: Mapped[str] = mapped_column(String(20), primary_key=True)
     window_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     requests: Mapped[int] = mapped_column(nullable=False, default=0)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    disabled: Mapped[bool] = mapped_column(default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class Membership(Base):
+    __tablename__ = "memberships"
+    __table_args__ = (
+        CheckConstraint("role IN ('owner','member','viewer')", name="membership_role"),
+    )
+
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    organization_id: Mapped[UUID] = mapped_column(ForeignKey("organizations.id"), primary_key=True)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class Invitation(Base):
+    __tablename__ = "invitations"
+    __table_args__ = (
+        CheckConstraint("role IN ('owner','member','viewer')", name="invitation_role"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(ForeignKey("organizations.id"), index=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+
+
+class AuthThrottle(Base):
+    __tablename__ = "auth_throttles"
+
+    bucket: Mapped[str] = mapped_column(String(100), primary_key=True)
+    requests: Mapped[int] = mapped_column(nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID | None] = mapped_column(index=True, nullable=True)
+    actor_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    actor_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    action: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    resource_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, index=True, nullable=False
+    )
+
+
+class UsageRecord(Base):
+    __tablename__ = "usage_records"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    organization_id: Mapped[UUID] = mapped_column(index=True, nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(nullable=False)
+    completion_tokens: Mapped[int] = mapped_column(nullable=False)
+    reported_cost_usd: Mapped[float | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, index=True, nullable=False
+    )
