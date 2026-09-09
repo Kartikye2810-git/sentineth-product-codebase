@@ -11,6 +11,7 @@ import os
 
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["SQL_ECHO"] = "false"
+os.environ["SENTINETH_ENVIRONMENT"] = "test"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,7 +19,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.api.auth import issue_session
 from app.db.database import Base, get_db
+from app.db.models import User
 from app.dependencies import (
     get_embedding_provider,
     get_llm_provider,
@@ -27,7 +30,7 @@ from app.dependencies import (
 )
 from app.main import app
 from app.providers.storage.local import LocalStorageProvider
-from app.security import require_organization_access
+from app.security import hash_password
 from app.settings import get_settings
 from app.worker import run_once
 from tests.fakes import (
@@ -99,9 +102,22 @@ def client(
     app.dependency_overrides[get_vector_store] = lambda: vector_store
     app.dependency_overrides[get_storage_provider] = lambda: storage_provider
     app.dependency_overrides[get_llm_provider] = lambda: llm_provider
-    app.dependency_overrides[require_organization_access] = lambda: None
+    with db_session_factory() as db:
+        user = User(
+            email="owner@example.com",
+            password_hash=hash_password("test-password-long"),
+        )
+        db.add(user)
+        db.flush()
+        session = issue_session(db, user)
+        owner_id = str(user.id)
+        db.commit()
 
-    with TestClient(app) as test_client:
+    headers = {"Authorization": "Bearer " + session.access_token}
+
+    with TestClient(app, headers=headers) as test_client:
+        test_client.owner_id = owner_id
+        test_client.owner_headers = headers
         def process_one():
             return asyncio.run(run_once(db_session_factory, embedding_provider, vector_store, storage_provider))
         test_client.process_one = process_one
@@ -124,13 +140,7 @@ def organization(client):
 
 @pytest.fixture
 def api_key_client(client):
-    """`client` with real API-key authentication restored.
-
-    The `client` fixture overrides require_organization_access away, which is
-    what the pipeline tests want. The api-key endpoints can only be tested
-    with it in place.
-    """
-    del app.dependency_overrides[require_organization_access]
+    """All clients exercise real authentication; individual requests can override headers."""
     return client
 
 

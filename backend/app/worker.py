@@ -13,12 +13,13 @@ from uuid import UUID
 
 from sqlalchemy import and_, delete, or_, select
 
+from app.audit import record
 from app.clock import utcnow
 from app.db.database import SessionLocal
 from app.db.models import Document, DocumentChunk, IngestionJob
 from app.dependencies import get_embedding_provider, get_storage_provider, get_vector_store
 from app.errors import DocumentProcessingError, ProviderUnavailable
-from app.logging_config import configure_logging
+from app.logging_config import configure_logging, request_id_var
 from app.services.ingestion_service import ingest_document
 from app.settings import get_settings
 
@@ -45,6 +46,8 @@ def claim(session_factory=SessionLocal) -> tuple[UUID, int] | None:
             job.status, job.error_code = "FAILED", "RETRIES_EXHAUSTED"
             document.status, document.error_code = "FAILED", "RETRIES_EXHAUSTED"
             job.lease_until = None
+            record(db, "document.failed", document.organization_id, document.id,
+                   job_id=str(job.id), error_code="RETRIES_EXHAUSTED")
             db.commit()
             return None
         job.attempts += 1
@@ -56,7 +59,7 @@ def claim(session_factory=SessionLocal) -> tuple[UUID, int] | None:
         return result
 
 
-async def run_once(session_factory=SessionLocal, embedding_provider=None,
+async def execute_once(session_factory=SessionLocal, embedding_provider=None,
                    vector_store=None, storage_provider=None) -> bool:
     selected = claim(session_factory)
     if selected is None:
@@ -70,6 +73,7 @@ async def run_once(session_factory=SessionLocal, embedding_provider=None,
             job = db.scalar(select(IngestionJob).where(IngestionJob.id == job_id).with_for_update())
             if document is None or job is None or job.status != "PROCESSING" or job.attempts != attempt:
                 return True
+            request_id_var.set(job.request_id)
             store = vector_store or get_vector_store()
             storage = storage_provider or get_storage_provider()
             # Repeated cleanup is safe, including after a partial upsert/crash.
@@ -84,6 +88,9 @@ async def run_once(session_factory=SessionLocal, embedding_provider=None,
                 provider = embedding_provider or get_embedding_provider()
                 await ingest_document(db, document, provider, store)
                 job.status, job.error_code, job.lease_until = "SUCCEEDED", None, None
+            record(db, "document.deleted" if job.operation == "DELETE" else "document.indexed",
+                   document.organization_id, document.id,
+                   job_id=str(job_id), attempt=attempt)
             db.commit()
     except Exception as exc:
         code = exc.code if isinstance(exc, DocumentProcessingError) else "PROVIDER_UNAVAILABLE"
@@ -103,8 +110,22 @@ async def run_once(session_factory=SessionLocal, embedding_provider=None,
                 document.status = ("DELETING" if job.operation == "DELETE" else "QUEUED") if retry else "FAILED"
                 document.error_code = code
                 document.error_message = "Processing failed; retry scheduled." if retry else "Processing failed. Reindex or delete this document."
+            record(db, "document.retry_scheduled" if retry else "document.failed",
+                   job.organization_id, job.document_id,
+                   job_id=str(job_id), error_code=code, attempt=attempt)
             db.commit()
     return True
+
+
+async def run_once(session_factory=SessionLocal, embedding_provider=None,
+                   vector_store=None, storage_provider=None) -> bool:
+    """Run one job with a request id scoped to it, and never leaked to the next."""
+    token = request_id_var.set(None)
+    try:
+        return await execute_once(session_factory, embedding_provider,
+                                  vector_store, storage_provider)
+    finally:
+        request_id_var.reset(token)
 
 
 async def serve(once=False):
@@ -125,5 +146,8 @@ async def serve(once=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true")
+    get_settings().validate_runtime("worker")
+    from app.observability import configure_error_tracking
+    configure_error_tracking()
     configure_logging()
     asyncio.run(serve(parser.parse_args().once))

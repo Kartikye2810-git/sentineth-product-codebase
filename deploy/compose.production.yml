@@ -1,0 +1,41 @@
+# External PostgreSQL and Qdrant; keep them on a private network with backups.
+# The image is built separately and tagged with the reviewed commit.
+x-app: &app
+  image: ${SENTINETH_IMAGE:?Set a reviewed image tag}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  env_file: production.env
+  environment:
+    SENTINETH_ENVIRONMENT: production
+    SENTINETH_SECRETS_DIR: /run/secrets
+    SENTINETH_STORAGE_DIR: /data/documents
+  secrets: [DATABASE_URL, NVIDIA_API_KEY, OPENROUTER_API_KEY, QDRANT_API_KEY, SENTINETH_METRICS_TOKEN]
+  volumes: [documents:/data/documents]
+
+services:
+  api:
+    <<: *app
+    ports: ["127.0.0.1:8000:8000"]
+  worker:
+    <<: *app
+    command: [python, -m, app.worker]
+    healthcheck:
+      disable: true
+
+secrets:
+  DATABASE_URL:
+    file: ./secrets/DATABASE_URL
+  NVIDIA_API_KEY:
+    file: ./secrets/NVIDIA_API_KEY
+  OPENROUTER_API_KEY:
+    file: ./secrets/OPENROUTER_API_KEY
+  QDRANT_API_KEY:
+    file: ./secrets/QDRANT_API_KEY
+  SENTINETH_METRICS_TOKEN:
+    file: ./secrets/SENTINETH_METRICS_TOKEN
+volumes:
+  documents:

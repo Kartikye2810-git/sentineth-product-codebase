@@ -1,248 +1,145 @@
 import logging
+import re
 import time
-from pathlib import Path
-from uuid import UUID, uuid4
+from contextlib import asynccontextmanager
+from uuid import uuid4
 
-from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-
-# Load environment variables from the project root.
-# Structure:
-# sentineth/
-# ├── .env
-# └── backend/
-#     └── app/
-#         └── main.py
-
-BASE_DIR = Path(__file__).resolve().parents[2]
-ENV_FILE = BASE_DIR / ".env"
-
-load_dotenv(ENV_FILE)
-
-
+from app.api.auth import router as auth_router
 from app.api.documents import router as documents_router
-from app.clock import utcnow
-from app.db import models
-from app.db.database import get_db
+from app.api.organizations import router as organizations_router
+from app.body_limit import BodyLimitMiddleware
+from app.errors import DocumentProcessingError
+from app.health import router as health_router
 from app.logging_config import configure_logging, request_id_var
-from app.schemas import (
-    ApiKeyIssued,
-    ApiKeyResponse,
-    ApiKeyRotateRequest,
-    OrganizationCreate,
-    OrganizationResponse,
-)
-from app.security import hash_api_key, new_api_key, require_organization_access
+from app.observability import configure_error_tracking, latency, metrics, requests
+from app.settings import get_settings
 
 
 configure_logging()
-
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    get_settings().validate_runtime()
+    configure_error_tracking()
+    yield
 
 
 app = FastAPI(
     title="Sentineth AI",
     description="Organizational Intelligence Platform",
-    version="0.1.0",
+    version="0.3.0",
+    lifespan=lifespan,
+)
+app.add_middleware(BodyLimitMiddleware)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_settings().allowed_hosts)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().allowed_origins,
+    allow_methods=["GET", "POST", "DELETE", "PATCH"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "Location", "Retry-After"],
 )
 
 
 @app.middleware("http")
 async def log_request(request: Request, call_next):
-    """One structured line per request, tagged with a request id.
-
-    The id is taken from an inbound X-Request-ID when the caller supplies
-    one, so a trace survives across services, and is echoed back on the
-    response either way. It lives in a contextvar, which is how every log
-    line emitted deeper in the stack picks it up.
-    """
-    request_id = request.headers.get("x-request-id") or uuid4().hex
+    supplied = request.headers.get("x-request-id", "")
+    request_id = supplied if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", supplied) else uuid4().hex
     token = request_id_var.set(request_id)
     started = time.perf_counter()
-
-    context = {
-        "method": request.method,
-        "path": request.url.path,
-    }
-
     try:
         response = await call_next(request)
-    except Exception:
-        logger.exception(
-            "request failed",
-            extra=context
-            | {"duration_ms": round((time.perf_counter() - started) * 1000, 2)},
+    except Exception as exc:
+        logger.error("Request failed", extra={"error_type": type(exc).__name__})
+        if get_settings().sentry_dsn.get_secret_value():
+            import sentry_sdk
+
+            sentry_sdk.capture_exception(exc)
+        response = JSONResponse({"detail": "Internal server error"}, status_code=500)
+    try:
+        route = getattr(request.scope.get("route"), "path", "unmatched")
+        method = (
+            request.method
+            if request.method in {"GET", "POST", "DELETE", "PATCH", "PUT", "OPTIONS", "HEAD"}
+            else "OTHER"
         )
-        raise
-    else:
+        duration = time.perf_counter() - started
+        requests.labels(method, route, str(response.status_code)).inc()
+        latency.labels(method, route).observe(duration)
+        identity = getattr(request.state, "actor", None)
+        actor_context = (
+            {
+                "actor_type": identity.actor_type,
+                "actor_id": str(identity.actor_id),
+                "organization_id": str(identity.organization_id)
+                if identity.organization_id
+                else None,
+            }
+            if identity
+            else {}
+        )
         logger.info(
             "request completed",
-            extra=context
+            extra=actor_context
             | {
+                "method": method,
+                "path": route,
                 "status_code": response.status_code,
-                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "duration_ms": round(duration * 1000, 2),
             },
         )
         response.headers["X-Request-ID"] = request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
         return response
     finally:
         request_id_var.reset(token)
 
 
-from app.body_limit import BodyLimitMiddleware
-from app.errors import DocumentProcessingError
-from app.settings import get_settings
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exc):
+    # FastAPI's default includes raw inputs, which can contain passwords/tokens.
+    return JSONResponse(
+        {
+            "detail": [
+                {key: error[key] for key in ("type", "loc", "msg") if key in error}
+                for error in exc.errors()
+            ]
+        },
+        status_code=422,
+    )
 
-
-get_settings()
-app.add_middleware(BodyLimitMiddleware)
 
 @app.exception_handler(DocumentProcessingError)
 async def processing_error(request, exc):
     logger.warning("Request rejected", extra={"error_code": exc.code})
-    return JSONResponse(status_code=exc.status_code,
+    return JSONResponse(
+        status_code=exc.status_code,
         content={"detail": {"error_code": exc.code, "message": str(exc)}},
-        headers={"Retry-After": "60"} if exc.status_code == 429 else None)
+        headers={"Retry-After": "60"} if exc.status_code == 429 else None,
+    )
+
 
 @app.exception_handler(LookupError)
 async def missing_document(request, exc):
     return JSONResponse(status_code=404, content={"detail": "Document not found."})
 
+
+app.include_router(auth_router)
+app.include_router(organizations_router)
 app.include_router(documents_router)
+app.include_router(health_router)
+app.add_api_route("/metrics", metrics, methods=["GET"], include_in_schema=False)
 
 
 @app.get("/")
-async def root():
-    return {
-        "name": "Sentineth AI",
-        "status": "online",
-        "version": "0.1.0",
-    }
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy"
-    }
-
-
-@app.post(
-    "/organizations",
-    response_model=OrganizationResponse,
-)
-def create_organization(
-    organization: OrganizationCreate,
-    db: Session = Depends(get_db),
-):
-    new_organization = models.Organization(
-        name=organization.name
-    )
-    api_key = new_api_key()
-    new_organization.api_keys.append(
-        models.OrganizationApiKey(token_hash=hash_api_key(api_key))
-    )
-
-    db.add(new_organization)
-    db.commit()
-    db.refresh(new_organization)
-
-    return OrganizationResponse.model_validate(new_organization).model_copy(
-        update={"api_key": api_key}
-    )
-
-
-@app.get(
-    "/organizations/{organization_id}/api-keys",
-    response_model=list[ApiKeyResponse],
-)
-def list_api_keys(
-    organization_id: UUID,
-    _: models.OrganizationApiKey = Depends(require_organization_access),
-    db: Session = Depends(get_db),
-):
-    """Metadata for every key ever issued to the organization.
-
-    ApiKeyResponse has no token or token_hash field, so neither can leak
-    here even if the ORM object grows one.
-    """
-    return list(
-        db.scalars(
-            select(models.OrganizationApiKey)
-            .where(models.OrganizationApiKey.organization_id == organization_id)
-            .order_by(models.OrganizationApiKey.created_at)
-        )
-    )
-
-
-@app.post(
-    "/organizations/{organization_id}/api-keys/rotate",
-    response_model=ApiKeyIssued,
-)
-def rotate_api_key(
-    organization_id: UUID,
-    payload: ApiKeyRotateRequest | None = None,
-    key: models.OrganizationApiKey = Depends(require_organization_access),
-    db: Session = Depends(get_db),
-):
-    """Issue a replacement key and revoke the one that authenticated here.
-
-    organization_id must be annotated: unannotated, FastAPI hands the route a
-    str, which SQLAlchemy then fails to adapt to a Uuid column.
-    """
-    token = new_api_key()
-    replacement = models.OrganizationApiKey(
-        organization_id=organization_id,
-        token_hash=hash_api_key(token),
-        expires_at=payload.expires_at if payload else None,
-    )
-
-    # Insert the replacement before revoking the current key, so a failure
-    # here cannot leave the organization with no usable key.
-    db.add(replacement)
-    db.flush()
-
-    key.revoked_at = utcnow()
-
-    db.commit()
-    db.refresh(replacement)
-
-    return ApiKeyIssued(
-        **ApiKeyResponse.model_validate(replacement).model_dump(),
-        api_key=token,
-    )
-
-
-@app.delete(
-    "/organizations/{organization_id}/api-keys/{key_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-def revoke_api_key(
-    organization_id: UUID,
-    key_id: UUID,
-    _: models.OrganizationApiKey = Depends(require_organization_access),
-    db: Session = Depends(get_db),
-):
-    """Revoke a key. Revoking is permanent; keys are never deleted, so the
-    audit trail of what was issued when survives."""
-    target = db.scalar(
-        select(models.OrganizationApiKey).where(
-            models.OrganizationApiKey.id == key_id,
-            models.OrganizationApiKey.organization_id == organization_id,
-        )
-    )
-
-    if target is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="API key not found for this organization",
-        )
-
-    # Already-revoked keys keep their original timestamp.
-    if target.revoked_at is None:
-        target.revoked_at = utcnow()
-        db.commit()
+def root():
+    return {"name": "Sentineth AI", "status": "online", "version": "0.3.0"}

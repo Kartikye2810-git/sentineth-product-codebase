@@ -1,5 +1,4 @@
 import asyncio
-import os
 import uuid
 from typing import Any
 
@@ -7,6 +6,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from app.providers.vector.base import VectorStore
+from app.settings import get_settings
 
 
 # The dense vector stays unnamed, so collections written before hybrid
@@ -30,11 +30,8 @@ class QdrantVectorStore(VectorStore):
         timeout: int = 30,
         hybrid: bool = False,
     ) -> None:
-        self.url = url or os.getenv(
-            "QDRANT_URL",
-            "http://localhost:6333",
-        )
-        self.api_key = api_key or os.getenv("QDRANT_API_KEY")
+        self.url = url or get_settings().qdrant_url
+        self.api_key = api_key or get_settings().qdrant_api_key.get_secret_value()
         self.collection_name = collection_name
 
         if vector_size <= 0:

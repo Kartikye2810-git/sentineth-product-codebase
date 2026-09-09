@@ -56,3 +56,8 @@ MarkupSafe==3.0.3
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 tzdata==2026.3
+
+pydantic-settings==2.15.0
+prometheus-client==0.26.0
+argon2-cffi==25.1.0
+sentry-sdk==2.69.1

@@ -48,18 +48,22 @@ The current MVP is the first vertical slice of this vision.
 
 The service currently supports:
 
-1. Creating an organization and managing its API keys
-2. Uploading a PDF document, answered with 202 and a `Location` to poll
-3. Saving the document locally, under `{org}/{document_id}/{filename}`
-4. Queueing an ingestion job in the same transaction as the document row
-5. Extracting text in a separate worker process, one entry per page
-6. Chunking on semantic boundaries, sized to the embedding model's window
-7. Generating embeddings (Nemotron by default, MiniLM offline)
-8. Storing embeddings in Qdrant, payload stamped with the organization
-9. Reporting `READY`, or `FAILED` with a stable error code, on the status route
-10. Searching semantically within an organization
-11. Retrieving relevant chunks and passing them to an LLM
-12. Returning an answer with citations that carry filename and page number
+1. Creating an account, signing in, and holding a revocable session
+2. Creating an organization as a signed-in person, and inviting others into it
+3. Managing its API keys, each carrying a role of its own
+4. Uploading a PDF document, answered with 202 and a `Location` to poll
+5. Saving the document locally, under `{org}/{document_id}/{filename}`
+6. Queueing an ingestion job in the same transaction as the document row
+7. Extracting text in a separate worker process, one entry per page
+8. Chunking on semantic boundaries, sized to the embedding model's window
+9. Generating embeddings (Nemotron by default, MiniLM offline)
+10. Storing embeddings in Qdrant, payload stamped with the organization
+11. Reporting `READY`, or `FAILED` with a stable error code, on the status route
+12. Searching semantically within an organization
+13. Retrieving relevant chunks and passing them to an LLM
+14. Returning an answer with citations that carry filename and page number
+15. Recording who did each of those, append-only, readable by an owner
+16. Reporting liveness, readiness, metrics and per-organization LLM usage
 
 The working flow is:
 
@@ -99,7 +103,9 @@ sentineth/
 │   ├── alembic/                  migrations
 │   ├── app/
 │   │   ├── api/
-│   │   │   └── documents.py      upload, status, list, delete, reindex, search, query
+│   │   │   ├── auth.py           login, logout, invitations, password change
+│   │   │   ├── documents.py      upload, status, list, delete, reindex, search, query
+│   │   │   └── organizations.py  tenants, members, keys, audit, usage
 │   │   ├── db/
 │   │   │   ├── database.py
 │   │   │   └── models.py
@@ -127,23 +133,35 @@ sentineth/
 │   │   │   ├── lexical_service.py
 │   │   │   ├── query_service.py
 │   │   │   └── retrieval_service.py
+│   │   ├── admin.py              operator CLI: users, owners, passwords
+│   │   ├── audit.py              append-only audit trail
+│   │   ├── backup.py             backup, verify, fail-closed restore
 │   │   ├── body_limit.py         ASGI request body cap
 │   │   ├── clock.py              one UTC clock, injectable in tests
 │   │   ├── dependencies.py       cached provider factories
 │   │   ├── errors.py             failure taxonomy and HTTP mapping
+│   │   ├── health.py             /live and /ready
+│   │   ├── identity_schemas.py   auth, membership, audit models
 │   │   ├── logging_config.py     structured JSON logging
 │   │   ├── main.py
+│   │   ├── observability.py      metrics and usage recording
+│   │   ├── relocate_storage.py   move the storage directory safely
 │   │   ├── schemas.py
-│   │   ├── security.py           bearer keys, hashing, route authorization
-│   │   ├── settings.py           validated resource limits
+│   │   ├── security.py           sessions, keys, hashing, role checks
+│   │   ├── settings.py           validated configuration and limits
 │   │   └── worker.py             claims and runs ingestion jobs
 │   ├── eval/                     retrieval corpus, question set, harness
 │   ├── scripts/reindex.py        rebuild vectors into a new collection
+│   ├── scripts/rehearse_restore.py  end-to-end recovery drill, run in CI
 │   ├── tests/
 │   ├── storage/
 │   │   └── documents/
 │   └── ...
+├── Dockerfile                    one image, API or worker
+├── compose.app.yml               API and worker on top of the data services
+├── deploy/                       production compose file and env template
 ├── docs/ROADMAP.md
+├── docs/OPERATIONS.md            deploy, backup, restore, incident procedures
 ├── .env
 └── info.md
 ```
@@ -256,13 +274,26 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_LLM_MODEL=...
 ```
 
-Resource limits are separate. They live on a validated pydantic model in
-`app/settings.py` and are overridden with `SENTINETH_`-prefixed variables
+Everything else lives on a validated pydantic model in `app/settings.py` and
+is overridden with `SENTINETH_`-prefixed variables - resource limits
 (`SENTINETH_MAX_UPLOAD_BYTES`, `SENTINETH_UPLOADS_PER_MINUTE`,
-`SENTINETH_JOB_MAX_ATTEMPTS`, and so on). Every one has a working default;
-set them when a tenant needs a different one, not to get started. Add new
-limits there rather than reading `os.getenv` at a call site, so an invalid
-value fails at startup instead of during someone's upload.
+`SENTINETH_JOB_MAX_ATTEMPTS`), identity (`SENTINETH_SESSION_HOURS`,
+`SENTINETH_INVITATION_HOURS`, `SENTINETH_AUTH_ATTEMPTS_PER_MINUTE`,
+`SENTINETH_MAX_ORGANIZATIONS_PER_USER`) and operations
+(`SENTINETH_ENVIRONMENT`, `SENTINETH_METRICS_TOKEN`, `SENTINETH_SENTRY_DSN`,
+`SENTINETH_ALLOWED_HOSTS`, `SENTINETH_ALLOWED_ORIGINS`,
+`SENTINETH_STORAGE_DIR`, `SENTINETH_SECRETS_DIR`). Every one has a working
+default; set them when a deployment needs a different one, not to get
+started. Add new settings there rather than reading `os.getenv` at a call
+site, so an invalid value fails at startup instead of during someone's
+upload.
+
+Secrets are `SecretStr`, and `SENTINETH_SECRETS_DIR` reads them from files
+rather than the environment. With `SENTINETH_ENVIRONMENT=production` the
+service refuses to start on SQLite, a metrics token under 32 characters, a
+wildcard host or origin, a plain-HTTP provider URL, `LOG_LEVEL=DEBUG` or
+`SQL_ECHO` - each of them fine locally and a hole in production, so the check
+belongs to the environment rather than to whoever reviews the deploy.
 
 Exact environment variable names should be confirmed against the provider implementations before adding or changing configuration.
 
@@ -320,12 +351,30 @@ Current important endpoints:
 
 ```text
 GET  /
-GET  /health
+GET  /live
+GET  /ready, /health
+GET  /metrics                                                        metrics token
 
-POST   /organizations
+POST   /auth/login
+POST   /auth/accept-invitation
+GET    /auth/me
+POST   /auth/logout
+POST   /auth/change-password
+
+POST   /organizations                                                session only
+GET    /organizations
+GET    /organizations/{organization_id}/members                      human owner
+PATCH  /organizations/{organization_id}/members/{user_id}            human owner
+DELETE /organizations/{organization_id}/members/{user_id}            human owner
+GET    /organizations/{organization_id}/invitations                  human owner
+POST   /organizations/{organization_id}/invitations                  human owner
+DELETE /organizations/{organization_id}/invitations/{invitation_id}  human owner
 GET    /organizations/{organization_id}/api-keys
+POST   /organizations/{organization_id}/api-keys
 POST   /organizations/{organization_id}/api-keys/rotate
 DELETE /organizations/{organization_id}/api-keys/{key_id}
+GET    /organizations/{organization_id}/audit-events
+GET    /organizations/{organization_id}/usage
 
 POST   /organizations/{organization_id}/documents                    202
 GET    /organizations/{organization_id}/documents
@@ -348,10 +397,17 @@ ingestion. That is the whole point of Phase 2: a request that blocks until
 indexing finishes is a request whose latency belongs to somebody else's
 document.
 
-The documents router lives at:
+`POST /organizations` takes a session, not a key: a key belongs to an
+organization, so it cannot be the thing that creates one. Membership changes
+take a session belonging to an owner - a key that leaks must not be able to
+add an owner to the organization it leaked from.
+
+The routers live at:
 
 ```text
+backend/app/api/auth.py
 backend/app/api/documents.py
+backend/app/api/organizations.py
 ```
 
 Organization IDs are UUIDs.
@@ -892,7 +948,20 @@ OrganizationRateLimit
 Document
 DocumentChunk
 IngestionJob
+User
+Membership
+UserSession
+Invitation
+AuthThrottle
+AuditEvent
+UsageRecord
 ```
+
+`AuditEvent` is append-only, enforced twice: an ORM guard in `app/audit.py`
+refuses to update or delete one, and a Postgres trigger rejects raw `UPDATE`,
+`DELETE` and `TRUNCATE` for everything that never goes through the ORM. A
+history the application can rewrite is not a history. Write audit rows with
+`record()`; never edit one.
 
 `IngestionJob` is the queue. It is a Postgres table rather than Redis so that
 the job and the document row it belongs to commit together: a queued job with
@@ -991,11 +1060,15 @@ Known limitations include:
 
 ### Auth
 
-- organization-scoped hashed bearer keys, with rotation and revocation
-- no users, memberships or roles - a key authenticates an organization, not a
-  person, so nothing can say who did what (Phase 3)
-- `POST /organizations` is unauthenticated and unthrottled. This is the top
-  blocker before any deployment.
+- users with Argon2id passwords, revocable sessions, single-use invitations
+- organization-scoped hashed bearer keys, with rotation and revocation, each
+  carrying a role of its own
+- no SSO, no MFA, and no self-service password reset - an operator runs
+  `python -m app.admin reset-password`
+- no email delivery, so an invitation token has to reach its recipient some
+  other way
+- permissions are per-organization, not per-source; per-channel permissions
+  arrive with connectors (Phase 5)
 
 ### Frontend
 
@@ -1166,7 +1239,10 @@ Never:
 
 - commit `.env`
 - expose API keys
-- log API keys
+- log API keys, session tokens or passwords
+- echo a credential back in an error or validation message
+- store a credential as anything but a hash - SHA-256 for tokens, Argon2id
+  for passwords
 - return secrets in API responses
 - trust organization IDs without authorization checks
 - allow one organization to query another
@@ -1219,7 +1295,7 @@ The suite is real now. Run it from `backend/`:
 
 ```bash
 ruff check .
-python -m pytest              # 82 passed, 2 skipped, under a second
+python -m pytest              # 104 passed, 2 skipped, a few seconds
 alembic upgrade head && alembic check
 ```
 
@@ -1234,6 +1310,23 @@ Two tests need a real Postgres, because SQLite cannot prove row locking or
 TEST_POSTGRES_URL=postgresql+psycopg://sentineth:sentineth_dev_password@localhost:5432/sentineth \
   python -m pytest tests/test_postgres_jobs.py
 ```
+
+The credential matrix in `tests/test_identity.py` enumerates the tenant
+routes from the running app rather than listing them by hand, so a route
+added later is covered the day it is added. Do not replace that with a
+literal list.
+
+Restore is also tested rather than documented. `scripts/rehearse_restore.py`
+runs the whole recovery procedure against a disposable database and
+collection, and CI runs it on every push:
+
+```bash
+python scripts/rehearse_restore.py --postgres-container sentineth-postgres
+```
+
+It needs the local `DATABASE_URL` to point at PostgreSQL and Qdrant to be up;
+it creates and drops its own databases and collections, and never touches the
+active corpus.
 
 Retrieval quality is a separate question from whether the code runs, and has
 a separate tool. It needs Qdrant and an embedding provider:
@@ -1605,7 +1698,7 @@ Migration/upgrade notes
 
 # 43. Current Milestone
 
-As of the end of Phase 2:
+As of the end of Phase 3:
 
 ```text
 Document ingestion:         WORKING, durable, off the request path
@@ -1624,11 +1717,16 @@ Retrieval evaluation:       WORKING (94.1% recall@5, MRR 0.832)
 FastAPI API:                WORKING
 Swagger/OpenAPI:            WORKING
 CI:                         WORKING
-Users, roles, audit log:    NOT YET (Phase 3)
-Production readiness:       NOT YET (Phase 3)
-Frontend:                   NOT YET (Phase 6)
-Auth:                       ORGANIZATION API KEYS ONLY
+Users, sessions, roles:     WORKING
+Invitations:                WORKING (no email delivery)
+Audit log:                  WORKING, append-only
+Health, readiness, metrics: WORKING
+Container and compose:      WORKING
+Backup and restore:         WORKING, rehearsed in CI
+Auth:                       SESSIONS AND ROLE-SCOPED API KEYS
+Knowledge model:            NOT YET (Phase 4)
 Connectors:                 NOT YET (Phase 5)
+Frontend:                   NOT YET (Phase 6)
 ```
 
 This is a hardened backend, not a finished product.
@@ -1637,18 +1735,18 @@ This is a hardened backend, not a finished product.
 
 # 44. Immediate Priorities
 
-`docs/ROADMAP.md` is the ordered list. The next phase is **Phase 3 —
-identity and operability**, and inside it:
+`docs/ROADMAP.md` is the ordered list. The next phase is **Phase 4 — the
+knowledge model**, and inside it:
 
-1. Close `POST /organizations`. Anyone who can reach the service can create an
-   organization, unauthenticated and unthrottled.
-2. Users, memberships and roles above the current organization API keys.
-3. The full credential matrix - missing, wrong, revoked, expired - against
-   every route. Phase 2 covered only cross-organization rejection.
-4. Append-only audit log of security and data events.
-5. An operable service: Dockerfile, readiness probes, metrics, configuration
-   validated at startup.
-6. Backups, and a restore that has actually been run.
+1. A `Source` abstraction above `Document`, so a Slack thread and a PDF are
+   both sources. Everything else in Phase 4, and every Phase 5 connector,
+   sits on it; introducing it after entities exist means rewriting them.
+2. The entity layer: people, projects, decisions, systems.
+3. The relationship layer connecting those entities.
+4. An extraction pipeline that populates both from sources, with confidence
+   and provenance.
+5. Entity-aware retrieval, measured against the existing eval harness rather
+   than assumed to be better.
 
 ## Current hardening checklist
 
@@ -1659,12 +1757,15 @@ identity and operability**, and inside it:
 - [x] CI on push and pull request
 - [x] Durable background ingestion, bounded inputs, explicit failure modes
 - [x] Retrieval evaluation harness and a question set
-- [ ] Users, roles, audit log, and the full credential test matrix
+- [x] Users, roles, audit log, and the full credential test matrix
+- [x] Container image, readiness probes, metrics, rehearsed restore
+- [ ] Sources, entities and relationships
 - [ ] Object storage, product UI, and connectors
 
-API keys are returned only when an organization is created. Store them in a
-secret manager and supply them as `Authorization: Bearer <key>` for document,
-search, and query requests.
+An API key is readable only at the moment it is issued. Store it in a secret
+manager and supply it as `Authorization: Bearer <key>` for document, search
+and query requests; a session token from `POST /auth/login` works the same way
+and carries the person's role instead.
 
 ---
 

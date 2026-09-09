@@ -1,9 +1,9 @@
-import os
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from app.providers.embeddings.base import EmbeddingProvider, InputType
+from app.settings import get_settings
 
 
 # The hosted API Catalog endpoint. NVIDIA serves these models behind an
@@ -39,7 +39,7 @@ class NvidiaEmbeddingProvider(EmbeddingProvider):
         batch_size: int = DEFAULT_BATCH_SIZE,
         **kwargs: Any,
     ) -> None:
-        self.api_key = api_key or os.getenv("NVIDIA_API_KEY")
+        self.api_key = api_key or get_settings().nvidia_api_key.get_secret_value()
 
         if not self.api_key:
             raise ValueError(
@@ -47,10 +47,7 @@ class NvidiaEmbeddingProvider(EmbeddingProvider):
             )
 
         self.model = model
-        self.base_url = base_url or os.getenv(
-            "NVIDIA_BASE_URL",
-            DEFAULT_BASE_URL,
-        )
+        self.base_url = base_url or get_settings().nvidia_base_url
         self.batch_size = batch_size
 
         kwargs.setdefault("timeout", 10.0)

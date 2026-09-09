@@ -1,14 +1,15 @@
-import os
 from typing import Any
 
 from openai import AsyncOpenAI
 
+from app.observability import capture_usage
 from app.providers.llm.base import LLMProvider
+from app.settings import get_settings
 
 
 class OpenRouterProvider(LLMProvider):
     def __init__(self) -> None:
-        api_key = os.getenv("OPENROUTER_API_KEY")
+        api_key = get_settings().openrouter_api_key.get_secret_value()
 
         if not api_key:
             raise ValueError(
@@ -19,16 +20,10 @@ class OpenRouterProvider(LLMProvider):
             api_key=api_key,
             timeout=10.0,
             max_retries=2,
-            base_url=os.getenv(
-                "OPENROUTER_BASE_URL",
-                "https://openrouter.ai/api/v1",
-            ),
+            base_url=get_settings().openrouter_base_url,
         )
 
-        self._model = os.getenv(
-            "OPENROUTER_LLM_MODEL",
-            "openrouter/free",
-        )
+        self._model = get_settings().openrouter_llm_model
 
     async def generate(
         self,
@@ -46,6 +41,8 @@ class OpenRouterProvider(LLMProvider):
             messages=messages,
             **kwargs,
         )
+
+        capture_usage(response, self._model)
 
         if not response.choices:
             raise ValueError(

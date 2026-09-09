@@ -13,6 +13,10 @@ jobs:
         working-directory: backend
 
     services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.0
+        ports:
+          - 6333:6333
       postgres:
         image: postgres:17
         env:
@@ -66,6 +70,13 @@ jobs:
         # Fails if app/db/models.py has drifted from alembic/versions.
         run: alembic check
 
+      - name: Rehearse database, source and vector recovery
+        run: python scripts/rehearse_restore.py --postgres-container ${{ job.services.postgres.id }}
+
+      - name: Build hosted application image
+        working-directory: .
+        run: docker build -t sentineth:ci .
+
   eval:
     # Non-blocking on purpose, and it must never be added to the required
     # checks. Retrieval quality is a number to watch and argue about, not a
@@ -89,6 +100,7 @@ jobs:
           - 6333:6333
 
     env:
+      DATABASE_URL: sqlite://
       QDRANT_URL: http://localhost:6333
       # nemotron-3-embed-1b is the model the application runs, so score it
       # when a key is reachable. Pull requests from forks get no secrets, so

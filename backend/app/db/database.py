@@ -1,26 +1,30 @@
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
+from app.settings import get_settings
 
-BASE_DIR = Path(__file__).resolve().parents[3]
 
-load_dotenv(BASE_DIR / ".env")
+settings = get_settings()
+database_url = settings.database_url.get_secret_value()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-
+# A connection attempt or pool wait that never returns turns one unreachable
+# database into a hung API process. SQLite accepts neither option.
+postgres_timeouts = (
+    {"pool_timeout": 3, "connect_args": {"connect_timeout": 3}}
+    if database_url.startswith("postgresql")
+    else {}
+)
 
 engine = create_engine(
-    DATABASE_URL,
+    database_url,
     # Statement logging is opt-in. Leaving echo on unconditionally logs
     # every query - including document content - and is slow.
-    echo=os.getenv("SQL_ECHO", "false").lower() in {"1", "true", "yes"},
+    echo=settings.sql_echo,
+    pool_pre_ping=True,
+    # Bound parameters can be document text or a password hash; keep them
+    # out of SQLAlchemy's own error messages.
+    hide_parameters=True,
+    **postgres_timeouts,
 )
 
 

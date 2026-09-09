@@ -8,10 +8,11 @@ that produced it.
 
 import json
 import logging
-import os
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
+
+from app.settings import get_settings
 
 
 request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
@@ -42,7 +43,12 @@ class JsonFormatter(logging.Formatter):
                 payload[key] = value
 
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            if get_settings().environment == 'production':
+                import traceback
+                payload['exception_type'] = record.exc_info[0].__name__
+                payload['stack'] = traceback.format_list(traceback.extract_tb(record.exc_info[2]))
+            else:
+                payload["exception"] = self.formatException(record.exc_info)
 
         return json.dumps(payload, default=str)
 
@@ -53,7 +59,7 @@ def configure_logging(level: str | None = None) -> None:
 
     root = logging.getLogger()
     root.handlers = [handler]
-    root.setLevel(level or os.getenv("LOG_LEVEL", "INFO").upper())
+    root.setLevel(level or get_settings().log_level)
 
     # The request middleware emits one structured line per request, so
     # uvicorn's plain-text access log would only duplicate it in a second
@@ -61,3 +67,6 @@ def configure_logging(level: str | None = None) -> None:
     access_logger = logging.getLogger("uvicorn.access")
     access_logger.handlers = []
     access_logger.propagate = False
+    for name in ("openai", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+

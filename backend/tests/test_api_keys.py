@@ -53,7 +53,7 @@ def test_rotate_rejects_missing_and_foreign_credentials(api_key_client):
     other_id, other_key = create_organization(api_key_client, "Other Inc")
 
     assert api_key_client.post(
-        f"/organizations/{org_id}/api-keys/rotate"
+        f"/organizations/{org_id}/api-keys/rotate", headers={"Authorization": ""}
     ).status_code == 401
 
     assert api_key_client.post(
@@ -91,6 +91,8 @@ def test_listing_keys_returns_metadata_and_never_a_token(api_key_client):
             "expires_at",
             "revoked_at",
             "active",
+            "role",
+            "label",
         }
 
     serialized = response.text

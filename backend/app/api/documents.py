@@ -16,6 +16,7 @@ from app.dependencies import (
     get_vector_store,
 )
 from app.errors import DocumentProcessingError, ProviderUnavailable
+from app.observability import finish_query, usage_context
 from app.providers.embeddings.base import EmbeddingProvider
 from app.providers.llm.base import LLMProvider
 from app.providers.rerank.base import RerankProvider
@@ -30,7 +31,7 @@ from app.schemas import (
     SearchRequest,
     SearchResponse,
 )
-from app.security import require_organization_access
+from app.security import require_member, require_organization_access
 from app.services.document_service import (
     consume_rate,
     get_document,
@@ -77,7 +78,8 @@ def document_status(organization_id: UUID, document_id: UUID, db: Session = Depe
     return DocumentResponse.model_validate(get_document(db, organization_id, document_id))
 
 
-@router.post("/{organization_id}/documents", status_code=202, response_model=DocumentUploadResponse)
+@router.post("/{organization_id}/documents", status_code=202,
+             dependencies=[Depends(require_member)], response_model=DocumentUploadResponse)
 def upload_document(organization_id: UUID, response: Response, file: UploadFile = File(...),
                     db: Session = Depends(get_db), storage: StorageProvider = Depends(get_storage_provider)):
     document = queue_document(db, organization_id, file, storage)
@@ -87,7 +89,8 @@ def upload_document(organization_id: UUID, response: Response, file: UploadFile 
                                   message="Document queued for processing.")
 
 
-@router.post("/{organization_id}/documents/{document_id}/reindex", status_code=202, response_model=DocumentResponse)
+@router.post("/{organization_id}/documents/{document_id}/reindex", status_code=202,
+             dependencies=[Depends(require_member)], response_model=DocumentResponse)
 def reindex_one_document(organization_id: UUID, document_id: UUID, response: Response,
                          db: Session = Depends(get_db)):
     document = queue_existing(db, organization_id, document_id, "INGEST")
@@ -95,7 +98,8 @@ def reindex_one_document(organization_id: UUID, document_id: UUID, response: Res
     return DocumentResponse.model_validate(document)
 
 
-@router.delete("/{organization_id}/documents/{document_id}", status_code=202, response_model=DocumentResponse)
+@router.delete("/{organization_id}/documents/{document_id}", status_code=202,
+               dependencies=[Depends(require_member)], response_model=DocumentResponse)
 def remove_document(organization_id: UUID, document_id: UUID, response: Response,
                     db: Session = Depends(get_db)):
     document = queue_existing(db, organization_id, document_id, "DELETE")
@@ -108,10 +112,12 @@ async def search_documents(organization_id: UUID, payload: SearchRequest,
     ready: list[str] = Depends(query_admission),
     embedding: EmbeddingProvider = Depends(get_embedding_provider),
     vectors: VectorStore = Depends(get_vector_store),
-    reranker: RerankProvider | None = Depends(get_rerank_provider)):
+    reranker: RerankProvider | None = Depends(get_rerank_provider),
+    db: Session = Depends(get_db)):
     try:
         results = await asyncio.wait_for(retrieve(organization_id, payload.query, embedding,
             vectors, payload.limit, reranker, document_ids=ready), get_settings().provider_timeout_seconds)
+        await asyncio.to_thread(finish_query, db, organization_id, "search", len(results), [])
         return SearchResponse(query=payload.query, results=results)
     except DocumentProcessingError:
         raise
@@ -128,10 +134,15 @@ async def query_documents(organization_id: UUID, payload: QueryRequest,
     embedding: EmbeddingProvider = Depends(get_embedding_provider),
     vectors: VectorStore = Depends(get_vector_store),
     llm: LLMProvider = Depends(get_llm_provider),
-    reranker: RerankProvider | None = Depends(get_rerank_provider)):
+    reranker: RerankProvider | None = Depends(get_rerank_provider),
+    db: Session = Depends(get_db)):
+    usage = []
+    usage_token = usage_context.set(usage)
+    result = None
     try:
-        return await asyncio.wait_for(answer_query(organization_id, payload.query, embedding,
+        result = await asyncio.wait_for(answer_query(organization_id, payload.query, embedding,
             vectors, llm, payload.limit, reranker, document_ids=ready), get_settings().provider_timeout_seconds)
+        return result
     except DocumentProcessingError:
         raise
     except ValueError as exc:
@@ -139,3 +150,8 @@ async def query_documents(organization_id: UUID, payload: QueryRequest,
     except Exception as exc:
         logger.exception("Answer provider failed")
         raise ProviderUnavailable("Answer provider is unavailable. Retry shortly.") from exc
+
+    finally:
+        usage_context.reset(usage_token)
+        await asyncio.to_thread(finish_query, db, organization_id, "query",
+            len(result["sources"]) if result else 0, usage, result is None)
